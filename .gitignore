@@ -1,0 +1,5 @@
+.idea
+wandb_runs
+__pycache__
+.python-version
+AAFieldDay.json
