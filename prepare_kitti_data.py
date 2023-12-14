@@ -63,7 +63,7 @@ def prepare_object_labels_parallel(use_all):
         if (not use_all) and (label_status != "LABELED"):
             continue
 
-        if (KITTIEnv.dataset == "kitti") and ("Crouch" in sample_dict["name"]):
+        if "Crouch" in sample_dict["name"]:
             continue
 
         frames = sample_dict["attributes"]["frames"]
