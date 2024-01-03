@@ -5,11 +5,7 @@ import os
 
 from kitti_env import KITTIEnv
 
-RENDERS_PATH = "renders"
 BBOX_COLOR = [1, 0, 0]
-LOOKAT = np.zeros(3)
-UP = np.array([0, 0, 1])
-ZOOM = 0.0001
 
 
 def main():
