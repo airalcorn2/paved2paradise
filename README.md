@@ -92,11 +92,21 @@ To run:
 python3 generate_kitti_synthetic_data.py <num_samples> <num_processes>
 ```
 
-You can visualize the generated synthetic samples with:
+You can visualize the generated synthetic samples with [`inspect_synthetic_samples.py`](inspect_synthetic_samples.py).
 
 ```bash
-python3 inspect_synthetic_samples.py
+python3 inspect_synthetic_samples.py save
 ```
+
+will save the necessary pieces for visualizing the first 100 samples in a ZIP defined by the `renders_dir` variable in `kitti_env.py`.
+
+```bash
+python3 inspect_synthetic_samples.py show
+```
+
+will visualize the samples saved in the ZIP.
+The reason this script has two parts is for use cases where the data is stored on a remote server.
+The first step saves the data for visualization in a ZIP, which can then be pulled to a local machine and visualized with the second step.
 
 ### Training a model
 

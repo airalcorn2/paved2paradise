@@ -56,6 +56,10 @@ class P2PEnv:
     # The maximum number of close object points to a ray that are used to estimate the
     # surface point of an object.
     neighbors = 2
+    # The minimum and maximum distance each new object can be placed from the previous
+    # object.
+    min_dist = 0.5
+    max_dist = 2.0
 
     # Directory names.
     parking_lot_dir = "parking_lot"

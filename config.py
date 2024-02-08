@@ -8,7 +8,7 @@ config = {
     "batch_size": 8,
     "max_drop_p": 0.2,
     "model_args": {
-        "position_encodings": 0,
+        "position_encodings": 6,
         "mlp_layers": [C],
         "block_layers": [
             (1, 4, C, 2 * C),
@@ -25,5 +25,5 @@ config = {
     "lr_reducer": 0.5,
     "epochs": 650,
     "use_amp": True,
-    "eval_every": 50000 // 8,
+    "eval_every": 64000 // 8,
 }

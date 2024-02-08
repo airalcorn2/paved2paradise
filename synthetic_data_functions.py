@@ -196,12 +196,9 @@ def simulate_scene(background_object_points, background_points, env_vars: P2PEnv
     return (simulated_object_points.astype("float32"), occluded_background_idxs)
 
 
-def put_object_in_background(object_f, background_f, new_xy, env_vars: P2PEnv):
+def put_object_in_background(object_f, background_points, new_xy, env_vars: P2PEnv):
     object_points = np.load(f"{env_vars.level_object_npys_path}/{object_f}")
     labels = np.load(f"{env_vars.level_object_labels_path}/{object_f}")
-    background_points = np.load(
-        f"{env_vars.unlevel_background_npys_path}/{background_f}"
-    )
 
     x_start_end = env_vars.x_start_end_background
     x_length = x_start_end[1] - x_start_end[0]

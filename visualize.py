@@ -79,7 +79,7 @@ def vis_seq():
     run_id = sys.argv[1]
     device = torch.device("cuda:0")
 
-    (model, config, root) = load_wandb_model(KITTIEnv, run_id, device)
+    (model, config, root) = load_wandb_model(KITTIEnv(), run_id, device)
 
     with open(KITTIEnv.kitti_data_dict_f) as f:
         data_dict = json.load(f)

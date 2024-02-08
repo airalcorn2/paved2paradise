@@ -69,6 +69,10 @@ class KITTIEnv(P2PEnv):
     # The maximum number of close object points to a ray that are used to estimate the
     # surface point of an object.
     neighbors = 2
+    # The minimum and maximum distance each new object can be placed from the previous
+    # object.
+    min_dist = 0.5
+    max_dist = 2.0
 
     # Directory names.
     parking_lot_dir = "parking_lot"
@@ -85,12 +89,13 @@ class KITTIEnv(P2PEnv):
     labels_dir = "labels"
     idxs_dir = "idxs"
     jsons_dir = "jsons"
+    renders_dir = "renders"
 
     # Dataset paths.
     datasets_root = "/home/michael/datasets"
     raw_backgrounds_path = f"{datasets_root}/KITTI/training"
 
-    raw_objects_path = f"{datasets_root}/Paved2Paradise/{raw_dir}/parking_lot"
+    raw_objects_path = f"{datasets_root}/Paved2Paradise/parking_lots"
     raw_object_pcds_path = f"{raw_objects_path}/{pcds_dir}"
 
     samples_path = f"{raw_backgrounds_path}/velodyne"

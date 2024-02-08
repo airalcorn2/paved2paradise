@@ -90,6 +90,11 @@ def prepare_object_labels_parallel(use_all):
 
 
 def worker(frames, show_pcd):
+    (min_x, max_x) = KITTIEnv.x_range
+    (min_y, max_y) = KITTIEnv.y_range
+    (min_z, max_z) = KITTIEnv.z_range
+    (samp_min_x, samp_max_x) = KITTIEnv.samp_x_range
+    (samp_min_y, samp_max_y) = KITTIEnv.samp_y_range
     for frame in frames:
         frame_name = frame.split(".bin")[0]
 
@@ -118,9 +123,6 @@ def worker(frames, show_pcd):
         )
         scan = scan.reshape((-1, 4))
         points = scan[:, :3]
-        (min_x, max_x) = KITTIEnv.x_range
-        (min_y, max_y) = KITTIEnv.y_range
-        (min_z, max_z) = KITTIEnv.z_range
         in_x = (min_x < points[:, 0]) & (points[:, 0] < max_x)
         in_y = (min_y < points[:, 1]) & (points[:, 1] < max_y)
         in_z = (min_z < points[:, 2]) & (points[:, 2] < max_z)
@@ -156,8 +158,6 @@ def worker(frames, show_pcd):
         bbox_idxs = []
         bbox_fs = []
         (has_ped, has_cyc) = (False, False)
-        (min_x, max_x) = KITTIEnv.samp_x_range
-        (min_y, max_y) = KITTIEnv.samp_y_range
         with open(f"{KITTIEnv.raw_backgrounds_path}/label_2/{frame_name}.txt") as f:
             ped_idx = 0
             for line in f:
@@ -171,8 +171,8 @@ def worker(frames, show_pcd):
                     # middle.
                     center = velo_center + np.array([0, 0, h / 2])
 
-                    in_x = min_x < center[0] < max_x
-                    in_y = min_y < center[1] < max_y
+                    in_x = samp_min_x < center[0] < samp_max_x
+                    in_y = samp_min_y < center[1] < samp_max_y
                     if not (in_x and in_y):
                         continue
 

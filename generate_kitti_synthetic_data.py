@@ -9,6 +9,9 @@ from kitti_env import KITTIEnv
 from PIL import Image
 from synthetic_data_functions import *
 
+(A, B, C) = KITTIEnv.abc
+BG_IDX = -1
+
 
 def level_object_scenes(label_fs):
     for label_f in label_fs:
@@ -202,8 +205,7 @@ def load_transforms(frame_name):
 
 
 def get_min_points_for_dist(dist):
-    (a, b, c) = KITTIEnv.abc
-    return KITTIEnv.min_prop * a * np.exp(-b * dist) + c
+    return KITTIEnv.min_prop * (A * np.exp(-B * dist) + C)
 
 
 def synthesize_samples(samp_names):
@@ -214,10 +216,15 @@ def synthesize_samples(samp_names):
     (min_x, max_x) = KITTIEnv.samp_x_range
     (min_y, max_y) = KITTIEnv.samp_y_range
     p2p_env = KITTIEnv()
+    human_count_props = np.load("human_count_props.npy")
+    human_counts = 1 + np.arange(len(human_count_props))
     for samp_name in samp_names:
         # Randomly sample background and object.
         background_f = np.random.choice(background_fs)
-        object_f = np.random.choice(object_fs)
+        background_points = np.load(
+            f"{KITTIEnv.unlevel_background_npys_path}/{background_f}"
+        )
+        object_idxs = np.full(len(background_points), BG_IDX)
 
         frame_name = background_f.split("_")[0]
         transforms = load_transforms(frame_name)
@@ -228,57 +235,135 @@ def synthesize_samples(samp_names):
         T_v2c[:3, :4] = transforms["Tr_velo_to_cam"]
         img = Image.open(f"{KITTIEnv.raw_backgrounds_path}/image_2/{frame_name}.png")
 
-        # Randomly sample object position.
-        x = np.random.uniform(min_x, max_x)
-        y = np.random.uniform(min_y, max_y)
-        while True:
-            (
-                occluded_object_points,
-                background_labels,
-                occluded_background_idxs,
-            ) = put_object_in_background(
-                object_f, background_f, np.array([x, y]), p2p_env
-            )
-            if len(occluded_object_points) == 0:
+        n_objects = np.random.choice(human_counts, p=human_count_props)
+        samp_object_fs = np.random.choice(object_fs, n_objects, replace=False)
+        (x, y) = (None, None)
+        object_infos = {}
+        all_bg_idxs = set(np.arange(len(background_points)))
+        remaining_bg_idxs = np.arange(len(background_points))
+        obj_idx = 0
+        for object_f in samp_object_fs:
+            # Randomly sample object position.
+            if x is None:
                 x = np.random.uniform(min_x, max_x)
                 y = np.random.uniform(min_y, max_y)
-                continue
 
-            # Only keep points that can be seen in the image.
-            ones = np.ones((len(occluded_object_points), 1))
-            hom_points = np.hstack([occluded_object_points, ones])
-            proj = (P2 @ R0_rect @ T_v2c @ hom_points.T).T
-            in_front = proj[:, 2] > 0
-            uvs = proj / proj[:, 2:3]
-            uvs[:, 2] = proj[:, 2]
-            in_width = (0 < uvs[:, 0]) & (uvs[:, 0] < img.size[0])
-            in_height = (0 < uvs[:, 1]) & (uvs[:, 1] < img.size[1])
-            keep = in_front & in_width & in_height
-            occluded_object_points = occluded_object_points[keep]
+            else:
+                # See: https://stackoverflow.com/questions/13064912/generate-a-uniformly-random-point-within-an-annulus-ring.
+                length_sq = np.random.uniform(
+                    KITTIEnv.min_dist**2, KITTIEnv.max_dist**2
+                )
+                length = length_sq**0.5
+                angle = np.random.uniform(0, 2 * np.pi)
 
-            # Check if object point cloud was too occluded.
-            dist = (x**2 + y**2) ** 0.5
-            if len(occluded_object_points) < get_min_points_for_dist(dist):
-                x = np.random.uniform(min_x, max_x)
-                y = np.random.uniform(-max_y, max_y)
-                continue
+                x = x + length * np.cos(angle)
+                y = y + length * np.sin(angle)
 
-            np.save(
-                f"{KITTIEnv.final_npys_path}/{samp_name}.npy", occluded_object_points
-            )
-            np.save(f"{KITTIEnv.final_labels_path}/{samp_name}.npy", background_labels)
-            np.save(
-                f"{KITTIEnv.final_idxs_path}/{samp_name}.npy", occluded_background_idxs
-            )
-            metadata = {
-                "background": background_f,
-                "object": object_f,
-                "object_position": (x, y),
-            }
-            with open(f"{KITTIEnv.final_jsons_path}/{samp_name}.json", "w") as f:
-                json.dump(metadata, f)
+            while True:
+                (
+                    occluded_object_points,
+                    background_labels,
+                    occluded_background_idxs,
+                ) = put_object_in_background(
+                    object_f, background_points, np.array([x, y]), p2p_env
+                )
+                # Check if bad ground spot.
+                if type(occluded_object_points) == list:
+                    x = np.random.uniform(min_x, max_x)
+                    y = np.random.uniform(-max_y, max_y)
+                    continue
 
-            break
+                # Check if object point cloud was too occluded.
+                if len(occluded_object_points) == 0:
+                    if obj_idx == 0:
+                        x = np.random.uniform(min_x, max_x)
+                        y = np.random.uniform(min_y, max_y)
+                        continue
+                    else:
+                        break
+
+                # Only keep points that can be seen in the image.
+                ones = np.ones((len(occluded_object_points), 1))
+                hom_points = np.hstack([occluded_object_points, ones])
+                proj = (P2 @ R0_rect @ T_v2c @ hom_points.T).T
+                in_front = proj[:, 2] > 0
+                uvs = proj / proj[:, 2:3]
+                uvs[:, 2] = proj[:, 2]
+                in_width = (0 < uvs[:, 0]) & (uvs[:, 0] < img.size[0])
+                in_height = (0 < uvs[:, 1]) & (uvs[:, 1] < img.size[1])
+                keep = in_front & in_width & in_height
+                occluded_object_points = occluded_object_points[keep]
+
+                # Check if object point cloud was too occluded.
+                dist = (x**2 + y**2) ** 0.5
+                if len(occluded_object_points) < get_min_points_for_dist(dist):
+                    if obj_idx == 0:
+                        x = np.random.uniform(min_x, max_x)
+                        y = np.random.uniform(-max_y, max_y)
+                        continue
+                    else:
+                        break
+
+                bg_mask = np.ones(len(background_points), dtype="bool")
+                bg_mask[occluded_background_idxs] = False
+                # Update data for previously added objects.
+                for prev_obj in list(object_infos):
+                    info = object_infos[prev_obj]
+                    prev_obj_idx = info["idx"]
+                    prev_obj_mask = bg_mask[object_idxs == prev_obj_idx]
+                    prev_obj_points = info["points"][prev_obj_mask]
+                    if len(prev_obj_points) < get_min_points_for_dist(dist):
+                        del object_infos[prev_obj]
+                    else:
+                        info["points"] = prev_obj_points
+
+                remaining_bg_mask = bg_mask[object_idxs == BG_IDX]
+                remaining_bg_idxs = remaining_bg_idxs[remaining_bg_mask]
+
+                background_points = np.concatenate(
+                    [background_points[bg_mask], occluded_object_points]
+                )
+                object_idxs = np.concatenate(
+                    [
+                        object_idxs[bg_mask],
+                        np.full(len(occluded_object_points), obj_idx),
+                    ]
+                )
+
+                object_infos[object_f] = {
+                    "idx": obj_idx,
+                    "points": occluded_object_points,
+                    "labels": background_labels,
+                    "position": (x, y),
+                }
+                obj_idx += 1
+
+                break
+
+        all_obj_points = []
+        all_obj_labels = []
+        all_obj_positions = []
+        for obj_f, info in object_infos.items():
+            all_obj_points.append(info["points"])
+            all_obj_labels.append(info["labels"])
+            all_obj_positions.append(info["position"])
+
+        all_obj_points = np.concatenate(all_obj_points)
+        np.save(f"{KITTIEnv.final_npys_path}/{samp_name}.npy", all_obj_points)
+        all_obj_labels = np.stack(all_obj_labels)
+        np.save(f"{KITTIEnv.final_labels_path}/{samp_name}.npy", all_obj_labels)
+        final_occluded_background_idxs = all_bg_idxs - set(remaining_bg_idxs)
+        np.save(
+            f"{KITTIEnv.final_idxs_path}/{samp_name}.npy",
+            np.array(list(final_occluded_background_idxs), dtype=int),
+        )
+        metadata = {
+            "background": background_f,
+            "objects": list(object_infos),
+            "object_positions": all_obj_positions,
+        }
+        with open(f"{KITTIEnv.final_jsons_path}/{samp_name}.json", "w") as f:
+            json.dump(metadata, f)
 
 
 def synthesize_samples_parallel():

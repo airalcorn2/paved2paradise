@@ -16,6 +16,55 @@ T_VAR_GLOBAL = 0.2
 SCALE_GLOBAL = (0.95, 1.05)
 
 
+def apply_augmentations(
+    bbox_label, max_drop_p, points, glob_scale, glob_R, glob_t, mirror
+):
+    center = bbox_label[:3]
+    extent = bbox_label[3:6]
+    bbox_R = bbox_label[6:].reshape(3, 3)
+
+    (min_x, max_x) = (center[0] - extent[0] / 2, center[0] + extent[0] / 2)
+    (min_y, max_y) = (center[1] - extent[1] / 2, center[1] + extent[1] / 2)
+    (min_z, max_z) = (center[2] - extent[2] / 2, center[2] + extent[2] / 2)
+    in_x = (min_x <= points[:, 0]) & (points[:, 0] <= max_x)
+    in_y = (min_y <= points[:, 1]) & (points[:, 1] <= max_y)
+    in_z = (min_z <= points[:, 2]) & (points[:, 2] <= max_z)
+    points = points[in_x & in_y & in_z]
+
+    # Apply object augmentations.
+    if max_drop_p > 0.0:
+        drop_p = np.random.uniform(0.0, max_drop_p)
+        ps = np.random.random(len(points))
+        drop = ps < drop_p
+        points = points[~drop]
+        if len(points) == 0:
+            return ([], [])
+
+    angle = np.random.uniform(-ROT_BOX, ROT_BOX)
+    R = Rotation.from_euler("Z", angle).as_matrix()
+    points = (R @ (points - center).T).T + center
+    bbox_R = R @ bbox_R
+
+    t = np.random.normal(T_MU_BOX, T_VAR_BOX**0.5, size=3)
+    points = points + t
+    center = center + t
+
+    # Apply global augmentations.
+    points = glob_scale * ((glob_R @ points.T).T + glob_t)
+    center = glob_scale * (glob_R @ center + glob_t)
+    extent = glob_scale * extent
+    bbox_R = glob_R @ bbox_R
+    if mirror:
+        points[:, 1] = -points[:, 1]
+        center[1] = -center[1]
+        rotvec = Rotation.from_matrix(bbox_R).as_rotvec()
+        rotvec[-1] = -rotvec[-1]
+        bbox_R = Rotation.from_rotvec(rotvec).as_matrix()
+
+    bbox_label = np.concatenate([center, extent, bbox_R.flatten()])
+    return (points, bbox_label)
+
+
 class KITTIDataset(Dataset):
     def __init__(
         self,
@@ -52,8 +101,6 @@ class KITTIDataset(Dataset):
             metadata = json.load(f)
 
         frame_name = json_f.split(".json")[0]
-        bbox_points = []
-        labels = []
         if self.dataset == "baseline":
             bbox_fs = metadata["bboxes"]
         else:
@@ -66,48 +113,38 @@ class KITTIDataset(Dataset):
             glob_scale = np.random.uniform(*SCALE_GLOBAL)
             mirror = np.random.random() > 0.5
 
+        bbox_points = []
+        labels = []
         for bbox_f in bbox_fs:
             points = np.load(f"{self.npys_path}/{bbox_f}")
             bbox_labels = np.load(f"{self.labels_path}/{bbox_f}")
-            if self.augment:
-                center = bbox_labels[:3]
-                extent = bbox_labels[3:6]
-                bbox_R = bbox_labels[6:].reshape(3, 3)
+            if len(bbox_labels.shape) == 1:
+                bbox_labels = bbox_labels[None]
 
-                # Apply object augmentations.
-                if self.max_drop_p > 0.0:
-                    drop_p = np.random.uniform(0.0, self.max_drop_p)
-                    ps = np.random.random(len(points))
-                    drop = ps < drop_p
-                    points = points[~drop]
-                    if len(points) == 0:
+            if self.augment:
+                for bbox_label in bbox_labels:
+                    (obj_points, bbox_label) = apply_augmentations(
+                        bbox_label,
+                        self.max_drop_p,
+                        points,
+                        glob_scale,
+                        glob_R,
+                        glob_t,
+                        mirror,
+                    )
+                    if len(obj_points) == 0:
                         continue
 
-                angle = np.random.uniform(-ROT_BOX, ROT_BOX)
-                R = Rotation.from_euler("Z", angle).as_matrix()
-                points = (R @ (points - center).T).T + center
-                bbox_R = R @ bbox_R
+                    bbox_points.append(obj_points)
+                    labels.append(bbox_label[None])
 
-                t = np.random.normal(T_MU_BOX, T_VAR_BOX**0.5, size=3)
-                points = points + t
-                center = center + t
+            else:
+                bbox_points.append(points)
+                labels.append(bbox_labels)
 
-                # Apply global augmentations.
-                points = glob_scale * ((glob_R @ points.T).T + glob_t)
-                center = glob_scale * (glob_R @ center + glob_t)
-                extent = glob_scale * extent
-                bbox_R = glob_R @ bbox_R
-                if mirror:
-                    points[:, 1] = -points[:, 1]
-                    center[1] = -center[1]
-                    rotvec = Rotation.from_matrix(bbox_R).as_rotvec()
-                    rotvec[-1] = -rotvec[-1]
-                    bbox_R = Rotation.from_rotvec(rotvec).as_matrix()
-
-                bbox_labels = np.concatenate([center, extent, bbox_R.flatten()])
-
-            bbox_points.append(points)
-            labels.append(bbox_labels)
+        if len(bbox_points) > 0:
+            bbox_points = np.concatenate(bbox_points)
+            labels = np.concatenate(labels)
 
         if self.dataset == "baseline":
             bg_points = np.load(f"{self.npys_path}/{frame_name}.npy")
@@ -127,9 +164,7 @@ class KITTIDataset(Dataset):
                 bg_points[:, 1] = -bg_points[:, 1]
 
         if len(bbox_points) > 0:
-            bbox_points = np.concatenate(bbox_points)
             points = np.concatenate([bbox_points, bg_points])
-            labels = np.stack(labels)
         else:
             points = bg_points
             labels = np.full(15, -500)
