@@ -9,7 +9,7 @@ The vertical red bars indicate the model's estimates of the bounding box centers
 
 This is the repository for the paper:
 
->[Michael A. Alcorn](https://sites.google.com/view/michaelaalcorn) and Noah Schwartz. [Paved2Paradise: Cost-Effective and Scalable LiDAR Simulation by Factoring the Real World](https://arxiv.org/abs/2312.01117). arXiv. 2023.
+>[Michael A. Alcorn](https://sites.google.com/view/michaelaalcorn) and Noah Schwartz. [Paved2Paradise: Cost-Effective and Scalable LiDAR Simulation by Factoring the Real World](https://arxiv.org/abs/2312.01117). CVPR Workshop on Synthetic Data for Computer Vision. 2024.
 
 ![Paved2Paradise Overview](Overview.png)
 An overview of the Paved2Paradise pipeline for generating synthetic scenes (left) and an example synthetic scene (right).
@@ -28,8 +28,8 @@ If you use this code for your own research, please cite:
 @article{alcorn2023paved2paradise,
    title={Paved2Paradise: Cost-Effective and Scalable LiDAR Simulation by Factoring the Real World},
    author={Alcorn, Michael A. and Schwartz, Noah},
-   journal={arXiv preprint arXiv:2312.01117},
-   year={2023}
+   journal={CVPR Workshop on Synthetic Data for Computer Vision},
+   year={2024}
 }
 ```
 
