@@ -704,7 +704,9 @@ class Paved2Paradise:
             )
         else:
             self.obj_window.scene.add_geometry("Points", self.pcds["obj"], self.mat)
-            self.obj_window.scene.add_geometry("Bounding Box", self.obj_bbox, self.bbox_mat)
+            self.obj_window.scene.add_geometry(
+                "Bounding Box", self.obj_bbox, self.bbox_mat
+            )
 
         if "bg" in self.pcds:
             self.simulate_scene()
@@ -890,28 +892,28 @@ class Paved2Paradise:
             background_object_points[:, 1], background_object_points[:, 0]
         )
         (min_angle, max_angle) = (object_angles.min(), object_angles.max())
+        azim_pm = 2 * np.pi / self.azim_res
+        min_angle -= azim_pm
+        max_angle += azim_pm
         if self.occlude:
-            azim_pm = 2 * np.pi / self.azim_res
-            min_angle -= azim_pm
-            max_angle += azim_pm
             background_angles = np.arctan2(
                 background_points[:, 1], background_points[:, 0]
             )
             in_cyl = (min_angle < background_angles) & (background_angles < max_angle)
             in_cyl_background_points = background_points[in_cyl]
 
-            hum_norms = np.linalg.norm(background_object_points, axis=1)
+            obj_norms = np.linalg.norm(background_object_points, axis=1)
             in_cyl_norms = np.linalg.norm(in_cyl_background_points, axis=1)
 
             # Occlude background points with object points.
-            further = in_cyl_norms >= hum_norms.min()
+            further = in_cyl_norms >= obj_norms.min()
             further_background_points = in_cyl_background_points[further]
             further_norms = in_cyl_norms[further]
             drop_mask = self.block(
                 further_background_points,
                 further_norms,
                 background_object_points,
-                hum_norms,
+                obj_norms,
                 self.occlude_bg_thresh,
             )
             occluded_background_idxs = np.arange(len(background_points))[in_cyl][
@@ -923,7 +925,7 @@ class Paved2Paradise:
 
             # Occlude object points with background points.
             unoccluded_norms = np.linalg.norm(unoccluded_points, axis=1)
-            closer = in_cyl_norms <= hum_norms.max()
+            closer = in_cyl_norms <= obj_norms.max()
             closer_background_points = in_cyl_background_points[closer]
             closer_norms = in_cyl_norms[closer]
             drop_mask = self.block(
