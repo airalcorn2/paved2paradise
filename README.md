@@ -35,7 +35,7 @@ If you use this code for your own research, please cite:
 
 ## Code
 
-Note that we have included a sample object scene point cloud ([`parking_lot.pcd`](parking_lot.pcd)) and three different background point clouds—an orchard scene ([`orchard.pcd`](orchard.pcd)), a scene from [KITTI](https://www.cvlibs.net/datasets/kitti/) ([`kitti.pcd`](kitti.pcd)), and a scene from [SemanticKITTI](http://www.semantic-kitti.org/index.html) ([`sem_kitti.pcd`](sem_kitti.pcd))—which are used by the demo script ([`paved2paradise_demo.py`](paved2paradise_demo.py)).
+Note that we have included a sample object scene point cloud ([`parking_lot.pcd`](parking_lot.pcd)) and three different background point clouds—an orchard scene ([`orchard.pcd`](orchard.pcd)), a scene from [KITTI](https://www.cvlibs.net/datasets/kitti/) ([`kitti.pcd`](kitti.pcd)), and a scene from [SemanticKITTI](http://www.semantic-kitti.org/index.html) ([`sem_kitti.pcd`](sem_kitti.pcd))—which can be used with the demo script ([`paved2paradise_demo.py`](paved2paradise_demo.py)).
 To run the full Paved2Paradise pipeline and train a model, you must provide your own object and background datasets.
 
 - [Installing the necessary Python packages](#installing-the-necessary-python-packages)
@@ -62,10 +62,13 @@ pip3 install -r requirements.txt
 
 ### Running the demo script
 
-[`paved2paradise_demo.py`](paved2paradise_demo.py) is an entirely stand-alone script that walks through each of the steps of Paved2Paradise:
+![Demo](paved2paradise_demo.png)
+
+[`paved2paradise_demo.py`](paved2paradise_demo.py) is a stand-alone GUI application that allows users to explore the Paved2Paradise pipeline with their own point clouds.
+To run:
 
 ```bash
-python3 paved2paradise_demo.py [orchard|kitti|sem_kitti]
+python3 paved2paradise_demo.py
 ```
 
 ### Preparing the object and background scenes
