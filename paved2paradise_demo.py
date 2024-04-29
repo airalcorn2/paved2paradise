@@ -416,6 +416,7 @@ class Paved2Paradise:
         obj_pcd = o3d.io.read_point_cloud(pcd_f)
         self.pcds["obj"] = obj_pcd
         color_by_dist(obj_pcd)
+        self.obj_window.scene.clear_geometry()
         self.obj_window.scene.add_geometry("Points", obj_pcd, self.mat)
         bbox = self.obj_window.scene.bounding_box
         self.obj_window.setup_camera(60.0, bbox, bbox.get_center())
@@ -498,6 +499,7 @@ class Paved2Paradise:
 
         self.pcds["bg"] = bg_pcd
         color_by_dist(bg_pcd)
+        self.bg_window.scene.clear_geometry()
         self.bg_window.scene.add_geometry("Points", bg_pcd, self.mat)
         bbox = self.bg_window.scene.bounding_box
         self.bg_window.setup_camera(60.0, bbox, bbox.get_center())
