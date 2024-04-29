@@ -443,6 +443,7 @@ class Paved2Paradise:
         self.create_ground_plane("obj")
         self.level_scene("obj")
         self.render_obj_scene()
+        self.new_scene = True
         self.simulate_scene()
 
     def render_bg_scene(self):
@@ -507,6 +508,7 @@ class Paved2Paradise:
         self.create_ground_plane("bg")
         self.level_scene("bg")
         self.render_bg_scene()
+        self.new_scene = True
         self.simulate_scene()
 
     def _on_rot_bg_scene(self, rot_bg_scene):
