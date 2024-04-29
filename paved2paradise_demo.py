@@ -34,6 +34,26 @@ def color_by_dist(pcd):
     pcd.colors = o3d.utility.Vector3dVector(point_colors)
 
 
+def move_object_to_position(points, bbox, xy):
+    object_angle = np.arctan2(bbox.center[1], bbox.center[0])
+    new_angle = np.arctan2(xy[1], xy[0])
+    rot_angle = new_angle - object_angle
+    R = Rotation.from_euler("Z", rot_angle).as_matrix()
+
+    xy_dist = np.linalg.norm(xy)
+    bbox_dir = xy / xy_dist
+    bbox_dir = np.array(list(bbox_dir) + [0])
+    shift = xy_dist - np.linalg.norm(bbox.center[:2])
+    new_points = (R @ points.T).T + shift * bbox_dir
+
+    new_center = np.array(list(xy) + [bbox.center[2]])
+    new_R = R @ bbox.R
+    bbox = o3d.geometry.OrientedBoundingBox(new_center, new_R, bbox.extent)
+    bbox.color = BBOX_COLOR
+
+    return (new_points, bbox)
+
+
 class Paved2Paradise:
     def __init__(self):
         self.w = None
@@ -52,8 +72,10 @@ class Paved2Paradise:
         self.ground_planes = {}
         self.ground_pcds = {}
         self.level_pcds = {}
+        self.level_ground_pcds = {}
         self.show_grid_pcds = {"obj": False, "bg": False}
         self.show_ground_planes = {"obj": False, "bg": False}
+        self.show_ground_pcds = {"obj": False, "bg": False}
         self.show_level_pcds = {"obj": True, "bg": True}
         self.obj_bbox = None
         self._settings_panel = None
@@ -124,7 +146,7 @@ class Paved2Paradise:
         bg_scene_button = gui.Button("Background Scene")
         bg_scene_button.set_on_clicked(self._on_open_background_scene)
 
-        rot_bg_scene = gui.Checkbox("Rotate Background Scene")
+        rot_bg_scene = gui.Checkbox("360° Background Scene")
         rot_bg_scene.set_on_checked(self._on_rot_bg_scene)
 
         v = gui.Vert(0.25 * em)
@@ -318,7 +340,6 @@ class Paved2Paradise:
 
         self._on_load_object_dialog_done("./parking_lot.pcd")
         self._on_load_background_dialog_done("./orchard.pcd")
-        self._on_show_new_obj_loc(self.show_new_obj_loc)
 
         app.run()
 
@@ -360,10 +381,38 @@ class Paved2Paradise:
     def _on_file_dialog_cancel(self):
         self.w.close_dialog()
 
+    def render_obj_scene(self):
+        self.obj_window.scene.clear_geometry()
+        if self.show_ground_pcds["obj"]:
+            if self.show_level_pcds["obj"]:
+                pcd = self.level_ground_pcds["obj"]
+            else:
+                pcd = self.ground_pcds["obj"]
+        else:
+            if self.show_level_pcds["obj"]:
+                pcd = self.level_pcds["obj"]
+                bbox = self.level_obj_bbox
+            else:
+                pcd = self.pcds["obj"]
+                bbox = self.obj_bbox
+
+            self.obj_window.scene.add_geometry("Bounding Box", bbox, self.bbox_mat)
+
+        self.obj_window.scene.add_geometry("Points", pcd, self.mat)
+
+        if self.show_grid_pcds["obj"]:
+            self.obj_window.scene.add_geometry(
+                "Grid Points", self.grid_pcds["obj"], self.mat
+            )
+
+        if self.show_ground_planes["obj"]:
+            self.obj_window.scene.add_geometry(
+                "Ground Plane", self.ground_planes["obj"], self.mat
+            )
+
     def _on_load_object_dialog_done(self, pcd_f):
         self.obj_path = pcd_f
         self.w.close_dialog()
-        self.obj_window.scene.clear_geometry()
         obj_pcd = o3d.io.read_point_cloud(pcd_f)
         self.pcds["obj"] = obj_pcd
         color_by_dist(obj_pcd)
@@ -388,16 +437,53 @@ class Paved2Paradise:
         bbox_R = Rotation.from_euler("Z", bbox["yaw"]).as_matrix()
         self.obj_bbox = o3d.geometry.OrientedBoundingBox(center, bbox_R, extent)
         self.obj_bbox.color = BBOX_COLOR
-        self.obj_window.scene.add_geometry("Bounding Box", self.obj_bbox, self.bbox_mat)
 
         self.create_grid_points("obj")
         self.create_ground_plane("obj")
         self.level_scene("obj")
+        self.render_obj_scene()
+        self.simulate_scene()
+
+    def render_bg_scene(self):
+        self.bg_window.scene.clear_geometry()
+        if self.show_level_pcds["bg"]:
+            if self.show_ground_pcds["bg"]:
+                pcd = self.level_ground_pcds["bg"]
+            else:
+                pcd = self.level_pcds["bg"]
+        else:
+            if self.show_ground_pcds["bg"]:
+                pcd = self.ground_pcds["bg"]
+            else:
+                pcd = self.pcds["bg"]
+
+        self.bg_window.scene.add_geometry("Points", pcd, self.mat)
+
+        if self.show_grid_pcds["bg"]:
+            self.bg_window.scene.add_geometry(
+                "Grid Points", self.grid_pcds["bg"], self.mat
+            )
+
+        if self.show_ground_planes["bg"]:
+            self.bg_window.scene.add_geometry(
+                "Ground Plane", self.ground_planes["bg"], self.mat
+            )
+
+        if self.show_new_obj_loc:
+            cyl = o3d.geometry.TriangleMesh.create_cylinder(CYL_RADIUS)
+            if self.show_level_pcds["bg"]:
+                z = self.level_obj_bbox.center[2]
+            else:
+                z = self.obj_bbox.center[2]
+
+            center = np.array([self.new_obj_xy[0], self.new_obj_xy[1], z])
+            cyl.translate(center, relative=False)
+            cyl.paint_uniform_color(BBOX_COLOR)
+            self.bg_window.scene.add_geometry("New Object Location", cyl, self.mat)
 
     def _on_load_background_dialog_done(self, pcd_f):
         self.bg_path = pcd_f
         self.w.close_dialog()
-        self.bg_window.scene.clear_geometry()
         bg_pcd = o3d.io.read_point_cloud(pcd_f)
         if self.rot_bg_scene:
             x = self.in_obj_xy[0]
@@ -418,215 +504,28 @@ class Paved2Paradise:
         self.create_grid_points("bg")
         self.create_ground_plane("bg")
         self.level_scene("bg")
+        self.render_bg_scene()
+        self.simulate_scene()
 
     def _on_rot_bg_scene(self, rot_bg_scene):
         self.rot_bg_scene = rot_bg_scene
 
-    def _on_show_new_obj_loc(self, show_new_obj_loc):
-        self.show_new_obj_loc = show_new_obj_loc
-        self.bg_window.scene.remove_geometry("New Object Location")
-        if show_new_obj_loc:
-            cyl = o3d.geometry.TriangleMesh.create_cylinder(CYL_RADIUS)
-            if self.show_level_pcds["bg"]:
-                z = self.level_obj_bbox.center[2]
-            else:
-                z = self.obj_bbox.center[2]
-
-            center = np.array([self.new_obj_xy[0], self.new_obj_xy[1], z])
-            cyl.translate(center, relative=False)
-            cyl.paint_uniform_color(BBOX_COLOR)
-            self.bg_window.scene.add_geometry("New Object Location", cyl, self.mat)
-
-        self.simulate_scene()
-
-    def create_grid_points(self, which):
-        points = np.array(self.pcds[which].points)
-        if which == "obj":
-            x = self.obj_bbox.center[0]
-            y = self.obj_bbox.center[1]
-        else:
-            x = self.new_obj_xy[0]
-            y = self.new_obj_xy[1]
-
-        x_start = x - self.grids_info[which]["length"] / 2
-        x_end = x_start + self.grids_info[which]["length"]
-        in_x = (x_start < points[:, 0]) & (points[:, 0] < x_end)
-        y_start = y - self.grids_info[which]["width"] / 2
-        y_end = y_start + self.grids_info[which]["width"]
-        in_y = (y_start < points[:, 1]) & (points[:, 1] < y_end)
-        region_points = points[in_x & in_y]
-
-        # Create a grid of points.
-        xs = np.linspace(x_start, x_end, self.grid_points)
-        ys = np.linspace(y_start, y_end, self.grid_points)
-        grid = np.stack(np.meshgrid(xs, ys)).transpose(1, 2, 0)
-        grid_points = grid.reshape(-1, 2)
-        grid_points = np.hstack([grid_points, np.zeros(len(grid_points))[:, None]])
-        grid_points += np.array([0, 0, region_points[:, 2].min()])
-        grid_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(grid_points))
-        grid_pcd.paint_uniform_color(GRID_COLOR)
-
-        self.grid_pcds[which] = grid_pcd
-        self.show_grid_points(which)
-
-    def create_ground_plane(self, which):
-        grid_width = self.grids_info[which]["width"]
-        grid_length = self.grids_info[which]["length"]
-        ground_plane = o3d.geometry.TriangleMesh.create_box(
-            width=grid_length, height=grid_width, depth=0.01
-        )
-        if which == "obj":
-            grid_x = self.obj_bbox.center[0]
-            grid_y = self.obj_bbox.center[1]
-        else:
-            grid_x = self.new_obj_xy[0]
-            grid_y = self.new_obj_xy[1]
-
-        center = np.array([grid_x, grid_y, 0])
-        ground_plane.translate(center, relative=False)
-
-        self.ground_planes[which] = ground_plane
-        self.show_ground_plane(which)
-
-    def _on_grid_points_changed(self, grid_points):
-        self.grid_points = int(grid_points)
-        for which in ["obj", "bg"]:
-            self.create_grid_points(which)
-            self.level_scene(which)
-
-    def _on_obj_grid_length_changed(self, grid_length):
-        self.grids_info["obj"]["length"] = float(grid_length)
-        self.create_grid_points("obj")
-        self.create_ground_plane("obj")
-        self.level_scene("obj")
-
-    def _on_obj_grid_width_changed(self, grid_width):
-        self.grids_info["obj"]["width"] = float(grid_width)
-        self.create_grid_points("obj")
-        self.create_ground_plane("obj")
-        self.level_scene("obj")
-
-    def _on_bg_grid_length_changed(self, grid_length):
-        self.grids_info["bg"]["length"] = float(grid_length)
-        self.create_grid_points("bg")
+    def _on_obj_x_changed(self, obj_x):
+        self.in_obj_xy[0] = float(obj_x)
+        self.new_obj_xy = self.scene_R[:2, :2] @ self.in_obj_xy
         self.create_ground_plane("bg")
-        self.level_scene("bg")
-
-    def _on_bg_grid_width_changed(self, grid_length):
-        self.grids_info["bg"]["width"] = float(grid_length)
         self.create_grid_points("bg")
-        self.create_ground_plane("bg")
         self.level_scene("bg")
-
-    def _on_show_obj_ground_plane(self, show_obj_ground_plane):
-        self.show_ground_planes["obj"] = show_obj_ground_plane
-        self.obj_window.scene.remove_geometry("Ground Plane")
-        if show_obj_ground_plane:
-            self.obj_window.scene.add_geometry(
-                "Ground Plane", self.ground_planes["obj"], self.mat
-            )
-
-    def _on_show_bg_ground_plane(self, show_bg_ground_plane):
-        self.show_ground_planes["bg"] = show_bg_ground_plane
-        self.bg_window.scene.remove_geometry("Ground Plane")
-        if show_bg_ground_plane:
-            self.bg_window.scene.add_geometry(
-                "Ground Plane", self.ground_planes["bg"], self.mat
-            )
-
-    def show_ground_plane(self, which):
-        if which == "obj":
-            self._on_show_obj_ground_plane(self.show_ground_planes["obj"])
-        else:
-            self._on_show_bg_ground_plane(self.show_ground_planes["bg"])
-
-    def _on_show_obj_grid_points(self, show_obj_ground_points):
-        self.show_grid_pcds["obj"] = show_obj_ground_points
-        self.obj_window.scene.remove_geometry("Grid Points")
-        if show_obj_ground_points:
-            self.obj_window.scene.add_geometry(
-                "Grid Points", self.grid_pcds["obj"], self.mat
-            )
-
-    def _on_show_bg_grid_points(self, show_bg_ground_points):
-        self.show_grid_pcds["bg"] = show_bg_ground_points
-        self.bg_window.scene.remove_geometry("Grid Points")
-        if show_bg_ground_points:
-            self.bg_window.scene.add_geometry(
-                "Grid Points", self.grid_pcds["bg"], self.mat
-            )
-
-    def show_grid_points(self, which):
-        if which == "obj":
-            self._on_show_obj_grid_points(self.show_grid_pcds["obj"])
-        else:
-            self._on_show_bg_grid_points(self.show_grid_pcds["bg"])
-
-    def _on_show_obj_ground_points(self, show_obj_ground_points):
-        self.obj_window.scene.remove_geometry("Points")
-        self.obj_window.scene.remove_geometry("Bounding Box")
-        if show_obj_ground_points:
-            self.obj_window.scene.add_geometry(
-                "Points", self.ground_pcds["obj"], self.mat
-            )
-        else:
-            if self.show_level_pcds["bg"]:
-                self.obj_window.scene.add_geometry(
-                    "Points", self.level_pcds["obj"], self.mat
-                )
-                self.obj_window.scene.add_geometry(
-                    "Bounding Box", self.level_obj_bbox, self.bbox_mat
-                )
-            else:
-                self.obj_window.scene.add_geometry("Points", self.pcds["obj"], self.mat)
-                self.obj_window.scene.add_geometry(
-                    "Bounding Box", self.obj_bbox, self.bbox_mat
-                )
-
-    def _on_show_bg_ground_points(self, show_bg_ground_points):
-        self.bg_window.scene.remove_geometry("Points")
-        if show_bg_ground_points:
-            self.bg_window.scene.add_geometry(
-                "Points", self.ground_pcds["bg"], self.mat
-            )
-        else:
-            if self.show_level_pcds["bg"]:
-                self.bg_window.scene.add_geometry(
-                    "Points", self.level_pcds["bg"], self.mat
-                )
-            else:
-                self.bg_window.scene.add_geometry("Points", self.pcds["bg"], self.mat)
-
-    def _on_hit_thresh_changed(self, hit_thresh):
-        self.hit_thresh = float(hit_thresh)
+        self.render_bg_scene()
         self.simulate_scene()
 
-    def _on_occlude_obj_thresh_changed(self, occlude_obj_thresh):
-        self.occlude_obj_thresh = float(occlude_obj_thresh)
-        self.simulate_scene()
-
-    def _on_occlude_bg_thresh_changed(self, occlude_bg_thresh):
-        self.occlude_bg_thresh = float(occlude_bg_thresh)
-        self.simulate_scene()
-
-    def _on_min_elev_changed(self, min_elev):
-        self.min_elev = float(min_elev)
-        self.simulate_scene()
-
-    def _on_max_elev_changed(self, max_elev):
-        self.max_elev = float(max_elev)
-        self.simulate_scene()
-
-    def _on_elev_res_changed(self, elev_res):
-        self.elev_res = int(elev_res)
-        self.simulate_scene()
-
-    def _on_azim_res_changed(self, azim_res):
-        self.azim_res = int(azim_res)
-        self.simulate_scene()
-
-    def _on_sensor2lidar_changed(self, sensor2lidar):
-        self.sensor2lidar = float(sensor2lidar)
+    def _on_obj_y_changed(self, obj_y):
+        self.in_obj_xy[1] = float(obj_y)
+        self.new_obj_xy = self.scene_R[:2, :2] @ self.in_obj_xy
+        self.create_ground_plane("bg")
+        self.create_grid_points("bg")
+        self.level_scene("bg")
+        self.render_bg_scene()
         self.simulate_scene()
 
     def level_scene(self, which):
@@ -677,6 +576,14 @@ class Paved2Paradise:
         level_pcd.colors = self.pcds[which].colors
         self.level_pcds[which] = level_pcd
 
+        # Transform the ground points.
+        level_ground_points = (R @ ground_points.T).T + t
+        level_ground_pcd = o3d.geometry.PointCloud(
+            o3d.utility.Vector3dVector(level_ground_points)
+        )
+        level_ground_pcd.colors = ground_pcd.colors
+        self.level_ground_pcds[which] = level_ground_pcd
+
         if which == "obj":
             center = R @ self.obj_bbox.center + t
             bbox_R = R @ self.obj_bbox.R
@@ -689,92 +596,176 @@ class Paved2Paradise:
             self.bg_t = -t
             self.bg_R = R
 
-        self.show_level_scene(which)
-
     def _on_level_object(self, level_obj):
         self.show_level_pcds["obj"] = level_obj
-        self.obj_window.scene.remove_geometry("Points")
-        self.obj_window.scene.remove_geometry("Bounding Box")
-        if level_obj:
-            self.obj_window.scene.add_geometry(
-                "Points", self.level_pcds["obj"], self.mat
-            )
-            self.obj_window.scene.add_geometry(
-                "Bounding Box", self.level_obj_bbox, self.bbox_mat
-            )
-        else:
-            self.obj_window.scene.add_geometry("Points", self.pcds["obj"], self.mat)
-            self.obj_window.scene.add_geometry(
-                "Bounding Box", self.obj_bbox, self.bbox_mat
-            )
-
-        if "bg" in self.pcds:
-            self.simulate_scene()
+        self.render_obj_scene()
+        self.simulate_scene()
 
     def _on_level_background(self, level_bg):
         self.show_level_pcds["bg"] = level_bg
-        self.bg_window.scene.remove_geometry("Points")
-        if level_bg:
-            self.bg_window.scene.add_geometry("Points", self.level_pcds["bg"], self.mat)
-        else:
-            self.bg_window.scene.add_geometry("Points", self.pcds["bg"], self.mat)
-
-        self._on_show_new_obj_loc(self.show_new_obj_loc)
+        self.render_bg_scene()
         self.simulate_scene()
-
-    def show_level_scene(self, which):
-        if which == "obj":
-            self._on_level_object(self.show_level_pcds[which])
-        else:
-            self._on_level_background(self.show_level_pcds[which])
-
-    def _on_obj_x_changed(self, obj_x):
-        self.in_obj_xy[0] = float(obj_x)
-        self.new_obj_xy = self.scene_R[:2, :2] @ self.in_obj_xy
-        self._on_show_new_obj_loc(self.show_new_obj_loc)
-        self.create_ground_plane("bg")
-        self.create_grid_points("bg")
-        self.level_scene("bg")
-        self.simulate_scene()
-
-    def _on_obj_y_changed(self, obj_y):
-        self.in_obj_xy[1] = float(obj_y)
-        self.new_obj_xy = self.scene_R[:2, :2] @ self.in_obj_xy
-        self._on_show_new_obj_loc(self.show_new_obj_loc)
-        self.create_ground_plane("bg")
-        self.create_grid_points("bg")
-        self.level_scene("bg")
-        self.simulate_scene()
-
-    def move_object_to_position(self, points, bbox, xy):
-        object_angle = np.arctan2(bbox.center[1], bbox.center[0])
-        new_angle = np.arctan2(xy[1], xy[0])
-        rot_angle = new_angle - object_angle
-        R = Rotation.from_euler("Z", rot_angle).as_matrix()
-
-        xy_dist = np.linalg.norm(xy)
-        bbox_dir = xy / xy_dist
-        bbox_dir = np.array(list(bbox_dir) + [0])
-        shift = xy_dist - np.linalg.norm(bbox.center[:2])
-        new_points = (R @ points.T).T + shift * bbox_dir
-
-        new_center = np.array(list(xy) + [bbox.center[2]])
-        new_R = R @ bbox.R
-        bbox = o3d.geometry.OrientedBoundingBox(new_center, new_R, bbox.extent)
-        bbox.color = BBOX_COLOR
-
-        return (new_points, bbox)
 
     def _on_occlude(self, occlude):
         self.occlude = occlude
+        self.simulate_scene()
+
+    def _on_sim_lidar(self, sim_lidar):
+        self.sim_lidar = sim_lidar
+        self.simulate_scene()
+
+    def _on_show_new_obj_loc(self, show_new_obj_loc):
+        self.show_new_obj_loc = show_new_obj_loc
+        self.render_bg_scene()
         self.simulate_scene()
 
     def _on_show_sector(self, show_sector):
         self.show_sector = show_sector
         self.simulate_scene()
 
-    def _on_sim_lidar(self, sim_lidar):
-        self.sim_lidar = sim_lidar
+    def create_grid_points(self, which):
+        points = np.array(self.pcds[which].points)
+        if which == "obj":
+            x = self.obj_bbox.center[0]
+            y = self.obj_bbox.center[1]
+        else:
+            x = self.new_obj_xy[0]
+            y = self.new_obj_xy[1]
+
+        x_start = x - self.grids_info[which]["length"] / 2
+        x_end = x_start + self.grids_info[which]["length"]
+        in_x = (x_start < points[:, 0]) & (points[:, 0] < x_end)
+        y_start = y - self.grids_info[which]["width"] / 2
+        y_end = y_start + self.grids_info[which]["width"]
+        in_y = (y_start < points[:, 1]) & (points[:, 1] < y_end)
+        region_points = points[in_x & in_y]
+
+        # Create a grid of points.
+        xs = np.linspace(x_start, x_end, self.grid_points)
+        ys = np.linspace(y_start, y_end, self.grid_points)
+        grid = np.stack(np.meshgrid(xs, ys)).transpose(1, 2, 0)
+        grid_points = grid.reshape(-1, 2)
+        grid_points = np.hstack([grid_points, np.zeros(len(grid_points))[:, None]])
+        grid_points += np.array([0, 0, region_points[:, 2].min()])
+        grid_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(grid_points))
+        grid_pcd.paint_uniform_color(GRID_COLOR)
+
+        self.grid_pcds[which] = grid_pcd
+
+    def create_ground_plane(self, which):
+        grid_width = self.grids_info[which]["width"]
+        grid_length = self.grids_info[which]["length"]
+        ground_plane = o3d.geometry.TriangleMesh.create_box(
+            width=grid_length, height=grid_width, depth=0.01
+        )
+        if which == "obj":
+            grid_x = self.obj_bbox.center[0]
+            grid_y = self.obj_bbox.center[1]
+        else:
+            grid_x = self.new_obj_xy[0]
+            grid_y = self.new_obj_xy[1]
+
+        center = np.array([grid_x, grid_y, 0])
+        ground_plane.translate(center, relative=False)
+
+        self.ground_planes[which] = ground_plane
+
+    def _on_grid_points_changed(self, grid_points):
+        self.grid_points = int(grid_points)
+        for which in ["obj", "bg"]:
+            self.create_grid_points(which)
+            self.level_scene(which)
+
+        self.render_obj_scene()
+        self.render_bg_scene()
+        self.simulate_scene()
+
+    def _on_obj_grid_length_changed(self, grid_length):
+        self.grids_info["obj"]["length"] = float(grid_length)
+        self.create_grid_points("obj")
+        self.create_ground_plane("obj")
+        self.level_scene("obj")
+        self.render_obj_scene()
+        self.simulate_scene()
+
+    def _on_obj_grid_width_changed(self, grid_width):
+        self.grids_info["obj"]["width"] = float(grid_width)
+        self.create_grid_points("obj")
+        self.create_ground_plane("obj")
+        self.level_scene("obj")
+        self.render_obj_scene()
+        self.simulate_scene()
+
+    def _on_bg_grid_length_changed(self, grid_length):
+        self.grids_info["bg"]["length"] = float(grid_length)
+        self.create_grid_points("bg")
+        self.create_ground_plane("bg")
+        self.level_scene("bg")
+        self.render_bg_scene()
+        self.simulate_scene()
+
+    def _on_bg_grid_width_changed(self, grid_length):
+        self.grids_info["bg"]["width"] = float(grid_length)
+        self.create_grid_points("bg")
+        self.create_ground_plane("bg")
+        self.level_scene("bg")
+        self.render_bg_scene()
+        self.simulate_scene()
+
+    def _on_show_obj_grid_points(self, show_obj_ground_points):
+        self.show_grid_pcds["obj"] = show_obj_ground_points
+        self.render_obj_scene()
+
+    def _on_show_obj_ground_plane(self, show_obj_ground_plane):
+        self.show_ground_planes["obj"] = show_obj_ground_plane
+        self.render_obj_scene()
+
+    def _on_show_obj_ground_points(self, show_obj_ground_points):
+        self.show_ground_pcds["obj"] = show_obj_ground_points
+        self.render_obj_scene()
+
+    def _on_show_bg_grid_points(self, show_bg_ground_points):
+        self.show_grid_pcds["bg"] = show_bg_ground_points
+        self.render_bg_scene()
+
+    def _on_show_bg_ground_plane(self, show_bg_ground_plane):
+        self.show_ground_planes["bg"] = show_bg_ground_plane
+        self.render_bg_scene()
+
+    def _on_show_bg_ground_points(self, show_bg_ground_points):
+        self.show_ground_pcds["bg"] = show_bg_ground_points
+        self.render_bg_scene()
+
+    def _on_hit_thresh_changed(self, hit_thresh):
+        self.hit_thresh = float(hit_thresh)
+        self.simulate_scene()
+
+    def _on_occlude_obj_thresh_changed(self, occlude_obj_thresh):
+        self.occlude_obj_thresh = float(occlude_obj_thresh)
+        self.simulate_scene()
+
+    def _on_occlude_bg_thresh_changed(self, occlude_bg_thresh):
+        self.occlude_bg_thresh = float(occlude_bg_thresh)
+        self.simulate_scene()
+
+    def _on_min_elev_changed(self, min_elev):
+        self.min_elev = float(min_elev)
+        self.simulate_scene()
+
+    def _on_max_elev_changed(self, max_elev):
+        self.max_elev = float(max_elev)
+        self.simulate_scene()
+
+    def _on_elev_res_changed(self, elev_res):
+        self.elev_res = int(elev_res)
+        self.simulate_scene()
+
+    def _on_azim_res_changed(self, azim_res):
+        self.azim_res = int(azim_res)
+        self.simulate_scene()
+
+    def _on_sensor2lidar_changed(self, sensor2lidar):
+        self.sensor2lidar = float(sensor2lidar)
         self.simulate_scene()
 
     def block(self, blockee, blockee_norms, blocker, blocker_norms, occlude_thresh):
@@ -840,6 +831,9 @@ class Paved2Paradise:
         return final_points
 
     def simulate_scene(self):
+        if not (("obj" in self.pcds) and ("bg" in self.pcds)):
+            return
+
         if self.show_level_pcds["obj"]:
             object_pcd = self.level_pcds["obj"]
             bbox = self.level_obj_bbox
@@ -861,7 +855,7 @@ class Paved2Paradise:
             object_points = object_points[object_points[:, 2] > 0]
 
         if self.show_new_obj_loc:
-            (background_object_points, bbox) = self.move_object_to_position(
+            (background_object_points, bbox) = move_object_to_position(
                 object_points, bbox, self.new_obj_xy
             )
         else:
