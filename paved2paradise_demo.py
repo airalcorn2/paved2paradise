@@ -734,6 +734,7 @@ class Paved2Paradise:
         self._on_show_new_obj_loc(self.show_new_obj_loc)
         self.create_ground_plane("bg")
         self.create_grid_points("bg")
+        self.level_scene("bg")
         self.simulate_scene()
 
     def _on_obj_y_changed(self, obj_y):
@@ -742,6 +743,7 @@ class Paved2Paradise:
         self._on_show_new_obj_loc(self.show_new_obj_loc)
         self.create_ground_plane("bg")
         self.create_grid_points("bg")
+        self.level_scene("bg")
         self.simulate_scene()
 
     def move_object_to_position(self, points, bbox, xy):
