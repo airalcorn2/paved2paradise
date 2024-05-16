@@ -80,6 +80,10 @@ class Paved2Paradise:
         self.obj_bbox = None
         self._settings_panel = None
         self.grid_points = 100
+        self.obj_x_range = (0, 13)
+        self.obj_y_range = (-5.625, 5.625)
+        self.bg_x_range = (0, 13)
+        self.bg_y_range = (-5.625, 5.625)
         self.new_obj_xy = np.array([9.98, 1.19])
         self.in_obj_xy = np.array([9.98, 1.19])
         self.grids_info = {
@@ -94,8 +98,7 @@ class Paved2Paradise:
         self.hit_thresh = 0.04
         self.occlude_obj_thresh = 0.04
         self.occlude_bg_thresh = 0.03
-        self.min_elev = -22.5
-        self.max_elev = 22.5
+        self.elev_range = (-22.5, 22.5)
         self.elev_res = 128
         self.azim_res = 2048
         self.sensor2lidar = 0.03618
@@ -149,10 +152,38 @@ class Paved2Paradise:
         rot_bg_scene = gui.Checkbox("360° Background Scene")
         rot_bg_scene.set_on_checked(self._on_rot_bg_scene)
 
+        obj_x_range_label = gui.Label("Object x Range (m)")
+        obj_x_range = gui.TextEdit()
+        obj_x_range.set_on_value_changed(self._on_obj_x_range_changed)
+        obj_x_range.text_value = str(self.obj_x_range)
+
+        obj_y_range_label = gui.Label("Object y Range (m)")
+        obj_y_range = gui.TextEdit()
+        obj_y_range.set_on_value_changed(self._on_obj_y_range_changed)
+        obj_y_range.text_value = str(self.obj_y_range)
+
+        bg_x_range_label = gui.Label("Background x Range (m)")
+        bg_x_range = gui.TextEdit()
+        bg_x_range.set_on_value_changed(self._on_bg_x_range_changed)
+        bg_x_range.text_value = str(self.bg_x_range)
+
+        bg_y_range_label = gui.Label("Object y Range (m)")
+        bg_y_range = gui.TextEdit()
+        bg_y_range.set_on_value_changed(self._on_bg_y_range_changed)
+        bg_y_range.text_value = str(self.bg_y_range)
+
         v = gui.Vert(0.25 * em)
         v.add_child(obj_scene_button)
         v.add_child(bg_scene_button)
         v.add_child(rot_bg_scene)
+        v.add_child(obj_x_range_label)
+        v.add_child(obj_x_range)
+        v.add_child(obj_y_range_label)
+        v.add_child(obj_y_range)
+        v.add_child(bg_x_range_label)
+        v.add_child(bg_x_range)
+        v.add_child(bg_y_range_label)
+        v.add_child(bg_y_range)
         pcd_loaders.add_child(v)
 
         final_scene = gui.CollapsableVert(
@@ -291,15 +322,10 @@ class Paved2Paradise:
         occlude_bg_thresh.set_on_value_changed(self._on_occlude_bg_thresh_changed)
         occlude_bg_thresh.text_value = str(self.occlude_bg_thresh)
 
-        min_elev_label = gui.Label("Minimum Elevation (°)")
-        min_elev = gui.TextEdit()
-        min_elev.set_on_value_changed(self._on_min_elev_changed)
-        min_elev.text_value = str(self.min_elev)
-
-        max_elev_label = gui.Label("Maximum Elevation (°)")
-        max_elev = gui.TextEdit()
-        max_elev.set_on_value_changed(self._on_max_elev_changed)
-        max_elev.text_value = str(self.max_elev)
+        elev_range_label = gui.Label("Elevation Range (°)")
+        elev_range = gui.TextEdit()
+        elev_range.set_on_value_changed(self._on_elev_range_changed)
+        elev_range.text_value = str(self.elev_range)
 
         elev_res_label = gui.Label("Elevation Resolution")
         elev_res = gui.TextEdit()
@@ -323,10 +349,8 @@ class Paved2Paradise:
         v.add_child(occlude_obj_thresh)
         v.add_child(occlude_bg_label)
         v.add_child(occlude_bg_thresh)
-        v.add_child(min_elev_label)
-        v.add_child(min_elev)
-        v.add_child(max_elev_label)
-        v.add_child(max_elev)
+        v.add_child(elev_range_label)
+        v.add_child(elev_range)
         v.add_child(elev_res_label)
         v.add_child(elev_res)
         v.add_child(azim_res_label)
@@ -414,6 +438,14 @@ class Paved2Paradise:
         self.obj_path = pcd_f
         self.w.close_dialog()
         obj_pcd = o3d.io.read_point_cloud(pcd_f)
+        points = np.array(obj_pcd.points)
+        in_x = (self.obj_x_range[0] < points[:, 0]) & (
+            points[:, 0] < self.obj_x_range[1]
+        )
+        in_y = (self.obj_y_range[0] < points[:, 1]) & (
+            points[:, 1] < self.obj_y_range[1]
+        )
+        obj_pcd = obj_pcd.select_by_index(np.where(in_x & in_y)[0])
         self.pcds["obj"] = obj_pcd
         color_by_dist(obj_pcd)
         self.obj_window.scene.clear_geometry()
@@ -487,6 +519,10 @@ class Paved2Paradise:
         self.bg_path = pcd_f
         self.w.close_dialog()
         bg_pcd = o3d.io.read_point_cloud(pcd_f)
+        points = np.array(bg_pcd.points)
+        in_x = (self.bg_x_range[0] < points[:, 0]) & (points[:, 0] < self.bg_x_range[1])
+        in_y = (self.bg_y_range[0] < points[:, 1]) & (points[:, 1] < self.bg_y_range[1])
+        bg_pcd = bg_pcd.select_by_index(np.where(in_x & in_y)[0])
         if self.rot_bg_scene:
             x = self.in_obj_xy[0]
             y = self.in_obj_xy[1]
@@ -514,8 +550,66 @@ class Paved2Paradise:
     def _on_rot_bg_scene(self, rot_bg_scene):
         self.rot_bg_scene = rot_bg_scene
 
+    def _on_dialog_ok(self):
+        self.w.close_dialog()
+
+    def _create_dialog(self, title, message):
+        dlg = gui.Dialog(title)
+
+        em = self.theme.font_size
+        dlg_layout = gui.Vert(em, gui.Margins(em, em, em, em))
+        dlg_layout.add_child(gui.Label(message))
+
+        ok_button = gui.Button("OK")
+        ok_button.set_on_clicked(self._on_dialog_ok)
+
+        dlg_layout.add_child(ok_button)
+        dlg.add_child(dlg_layout)
+        self.w.show_dialog(dlg)
+
+    def _on_obj_x_range_changed(self, obj_x_range):
+        try:
+            self.obj_x_range = eval(obj_x_range)
+        except:
+            self._create_dialog(
+                "Input Error", "Object x-range must be a tuple of floats."
+            )
+            return
+
+    def _on_obj_y_range_changed(self, obj_y_range):
+        try:
+            self.obj_y_range = eval(obj_y_range)
+        except:
+            self._create_dialog(
+                "Input Error", "Object y-range must be a tuple of floats."
+            )
+            return
+
+    def _on_bg_x_range_changed(self, bg_x_range):
+        try:
+            self.bg_x_range = eval(bg_x_range)
+        except:
+            self._create_dialog(
+                "Input Error", "Background x-range must be a tuple of floats."
+            )
+            return
+
+    def _on_bg_y_range_changed(self, bg_y_range):
+        try:
+            self.bg_y_range = eval(bg_y_range)
+        except:
+            self._create_dialog(
+                "Input Error", "Background y-range must be a tuple of floats."
+            )
+            return
+
     def _on_obj_x_changed(self, obj_x):
-        self.in_obj_xy[0] = float(obj_x)
+        try:
+            self.in_obj_xy[0] = float(obj_x)
+        except ValueError:
+            self._create_dialog("Input Error", "Object x-coordinate must be a float.")
+            return
+
         self.new_obj_xy = self.scene_R[:2, :2] @ self.in_obj_xy
         self.create_ground_plane("bg")
         self.create_grid_points("bg")
@@ -524,7 +618,12 @@ class Paved2Paradise:
         self.simulate_scene()
 
     def _on_obj_y_changed(self, obj_y):
-        self.in_obj_xy[1] = float(obj_y)
+        try:
+            self.in_obj_xy[1] = float(obj_y)
+        except ValueError:
+            self._create_dialog("Input Error", "Object y-coordinate must be a float.")
+            return
+
         self.new_obj_xy = self.scene_R[:2, :2] @ self.in_obj_xy
         self.create_ground_plane("bg")
         self.create_grid_points("bg")
@@ -675,7 +774,12 @@ class Paved2Paradise:
         self.ground_planes[which] = ground_plane
 
     def _on_grid_points_changed(self, grid_points):
-        self.grid_points = int(grid_points)
+        try:
+            self.grid_points = int(grid_points)
+        except ValueError:
+            self._create_dialog("Input Error", "Grid Points must be an integer.")
+            return
+
         for which in ["obj", "bg"]:
             self.create_grid_points(which)
             self.level_scene(which)
@@ -685,7 +789,12 @@ class Paved2Paradise:
         self.simulate_scene()
 
     def _on_obj_grid_length_changed(self, grid_length):
-        self.grids_info["obj"]["length"] = float(grid_length)
+        try:
+            self.grids_info["obj"]["length"] = float(grid_length)
+        except ValueError:
+            self._create_dialog("Input Error", "Object Grid Length must be a float.")
+            return
+
         self.create_grid_points("obj")
         self.create_ground_plane("obj")
         self.level_scene("obj")
@@ -693,7 +802,12 @@ class Paved2Paradise:
         self.simulate_scene()
 
     def _on_obj_grid_width_changed(self, grid_width):
-        self.grids_info["obj"]["width"] = float(grid_width)
+        try:
+            self.grids_info["obj"]["width"] = float(grid_width)
+        except ValueError:
+            self._create_dialog("Input Error", "Object Grid Width must be a float.")
+            return
+
         self.create_grid_points("obj")
         self.create_ground_plane("obj")
         self.level_scene("obj")
@@ -701,7 +815,14 @@ class Paved2Paradise:
         self.simulate_scene()
 
     def _on_bg_grid_length_changed(self, grid_length):
-        self.grids_info["bg"]["length"] = float(grid_length)
+        try:
+            self.grids_info["bg"]["length"] = float(grid_length)
+        except ValueError:
+            self._create_dialog(
+                "Input Error", "Background Grid Length must be a float."
+            )
+            return
+
         self.create_grid_points("bg")
         self.create_ground_plane("bg")
         self.level_scene("bg")
@@ -709,7 +830,12 @@ class Paved2Paradise:
         self.simulate_scene()
 
     def _on_bg_grid_width_changed(self, grid_length):
-        self.grids_info["bg"]["width"] = float(grid_length)
+        try:
+            self.grids_info["bg"]["width"] = float(grid_length)
+        except ValueError:
+            self._create_dialog("Input Error", "Background Grid Width must be a float.")
+            return
+
         self.create_grid_points("bg")
         self.create_ground_plane("bg")
         self.level_scene("bg")
@@ -741,35 +867,74 @@ class Paved2Paradise:
         self.render_bg_scene()
 
     def _on_hit_thresh_changed(self, hit_thresh):
-        self.hit_thresh = float(hit_thresh)
+        try:
+            self.hit_thresh = float(hit_thresh)
+        except ValueError:
+            self._create_dialog("Input Error", "Hit Threshold must be a float.")
+            return
+
         self.simulate_scene()
 
     def _on_occlude_obj_thresh_changed(self, occlude_obj_thresh):
-        self.occlude_obj_thresh = float(occlude_obj_thresh)
+        try:
+            self.occlude_obj_thresh = float(occlude_obj_thresh)
+        except ValueError:
+            self._create_dialog(
+                "Input Error", "Occlude Object Threshold must be a float."
+            )
+            return
+
         self.simulate_scene()
 
     def _on_occlude_bg_thresh_changed(self, occlude_bg_thresh):
-        self.occlude_bg_thresh = float(occlude_bg_thresh)
+        try:
+            self.occlude_bg_thresh = float(occlude_bg_thresh)
+        except ValueError:
+            self._create_dialog(
+                "Input Error", "Occlude Background Threshold must be a float."
+            )
+            return
+
         self.simulate_scene()
 
-    def _on_min_elev_changed(self, min_elev):
-        self.min_elev = float(min_elev)
-        self.simulate_scene()
+    def _on_elev_range_changed(self, elev_range):
+        try:
+            self.elev_range = eval(elev_range)
+        except:
+            self._create_dialog(
+                "Input Error", "Elevation Range must be a tuple of floats."
+            )
+            return
 
-    def _on_max_elev_changed(self, max_elev):
-        self.max_elev = float(max_elev)
         self.simulate_scene()
 
     def _on_elev_res_changed(self, elev_res):
-        self.elev_res = int(elev_res)
+        try:
+            self.elev_res = int(elev_res)
+        except ValueError:
+            self._create_dialog(
+                "Input Error", "Elevation Resolution must be an integer."
+            )
+            return
+
         self.simulate_scene()
 
     def _on_azim_res_changed(self, azim_res):
-        self.azim_res = int(azim_res)
+        try:
+            self.azim_res = int(azim_res)
+        except ValueError:
+            self._create_dialog("Input Error", "Azimuth Resolution must be an integer.")
+            return
+
         self.simulate_scene()
 
     def _on_sensor2lidar_changed(self, sensor2lidar):
-        self.sensor2lidar = float(sensor2lidar)
+        try:
+            self.sensor2lidar = float(sensor2lidar)
+        except ValueError:
+            self._create_dialog("Input Error", "Sensor to LiDAR must be a float.")
+            return
+
         self.simulate_scene()
 
     def block(self, blockee, blockee_norms, blocker, blocker_norms, occlude_thresh):
@@ -793,7 +958,7 @@ class Paved2Paradise:
         max_azim = point_angles.max() + azim_pm
         azims = np.linspace(-np.pi, np.pi, self.azim_res, False)
         azims = azims[(min_azim < azims) & (azims < max_azim)]
-        (min_elev, max_elev) = (np.deg2rad(self.min_elev), np.deg2rad(self.max_elev))
+        (min_elev, max_elev) = np.deg2rad(self.elev_range)
         elevs = np.linspace(min_elev, max_elev, self.elev_res)
         elev_azims = (
             np.stack(np.meshgrid(-elevs, azims)).transpose(1, 2, 0).reshape(-1, 2)
