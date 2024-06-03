@@ -23,7 +23,6 @@ class KITTIEnv(P2PEnv):
     elevs = np.linspace(min_elev, max_elev, vert_res)
     horiz_res = 2083
     azims = np.linspace(-np.pi, np.pi, horiz_res, False)
-    azim_pm = 2 * np.pi / horiz_res
     # For some lidar sensors, like the Ouster, the sensor frame is shifted relative to
     # the lidar frame. See Section 3.1 in:
     # https://data.ouster.io/downloads/software-user-manual/software-user-manual-v2p0.pdf.
@@ -64,6 +63,11 @@ class KITTIEnv(P2PEnv):
     # The proportion of KITTI training data that can potentially be used for
     # backgrounds.
     train_p = 0.9
+    # A fudge factor for determining the sector of blocker points for given blockee
+    # points.
+    azim_pm = 2 * np.pi / horiz_res
+    # The maximum angle for a sector when performing the occlusion procedure.
+    max_sector_angle = np.radians(2.25)
     # The forward direction for the LiDAR sensor.
     fwd = np.array([1, 0, 0])
     # The maximum number of close object points to a ray that are used to estimate the

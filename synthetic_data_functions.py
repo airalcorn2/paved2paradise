@@ -69,17 +69,64 @@ def move_object_to_position(points, bbox, xy):
     return (new_points, bbox)
 
 
-def block(blockee, blockee_norms, blocker, blocker_norms, occlude_thresh):
+def block(blockee, blocker, max_sector_angle, azim_pm, occlude_thresh):
     # Occlude blockee points with blocker points. See:
     # https://math.stackexchange.com/a/2599689/614328.
+    blockee_angles = np.arctan2(blockee[:, 1], blockee[:, 0])
+    blockee_min_angle = blockee_angles.min()
+    blockee_max_angle = blockee_angles.max()
 
-    Ds = blockee / blockee_norms[:, None]
-    t_Ps = Ds @ blocker.T
-    ray_dists = (blocker_norms**2 - t_Ps**2) ** 0.5
-    less_thresh = ray_dists < occlude_thresh
-    # Points can only be occluded by points that are closer to the sensor.
-    closer_point = blockee_norms[:, None] > blocker_norms
-    drop_mask = (less_thresh & closer_point).any(1)
+    blocker_angles = np.arctan2(blocker[:, 1], blocker[:, 0])
+    blocker_min_angle = blocker_angles.min()
+    blocker_max_angle = blocker_angles.max()
+
+    min_angle = max(blockee_min_angle, blocker_min_angle)
+    max_angle = min(blockee_max_angle, blocker_max_angle)
+    drop_mask = np.zeros(len(blockee), dtype=bool)
+    # No overlap between the two point clouds.
+    if max_angle <= min_angle:
+        return drop_mask
+
+    for start_angle in np.arange(min_angle, max_angle, max_sector_angle):
+        # Only consider points that are in the same cylindrical slice (+/- a few
+        # degrees).
+        end_angle = min(max_angle, start_angle + max_sector_angle)
+        blockee_mask = (start_angle < blockee_angles) & (blockee_angles < end_angle)
+        in_cyl_blockee = blockee[blockee_mask]
+        in_cyl_blockee_norms = np.linalg.norm(in_cyl_blockee, axis=1)
+
+        start_angle -= azim_pm
+        end_angle += azim_pm
+
+        blocker_mask = (start_angle < blocker_angles) & (blocker_angles < end_angle)
+        in_cyl_blocker = blocker[blocker_mask]
+        # No blocker points.
+        if len(in_cyl_blocker) == 0:
+            continue
+
+        in_cyl_blocker_norms = np.linalg.norm(in_cyl_blocker, axis=1)
+
+        further = in_cyl_blockee_norms >= in_cyl_blocker_norms.min()
+        in_cyl_blockee = in_cyl_blockee[further]
+        # All blocker points are further away than the blockee points.
+        if len(in_cyl_blockee) == 0:
+            continue
+
+        in_cyl_blockee_norms = in_cyl_blockee_norms[further]
+
+        closer = in_cyl_blocker_norms <= in_cyl_blockee_norms.max()
+        in_cyl_blocker = in_cyl_blocker[closer]
+        in_cyl_blocker_norms = in_cyl_blocker_norms[closer]
+
+        Ds = in_cyl_blockee / in_cyl_blockee_norms[:, None]
+        t_Ps = Ds @ in_cyl_blocker.T
+        ray_dists = (in_cyl_blocker_norms**2 - t_Ps**2) ** 0.5
+        less_thresh = ray_dists < occlude_thresh
+        # Points can only be occluded by points that are closer to the sensor.
+        closer_point = in_cyl_blockee_norms[:, None] > in_cyl_blocker_norms
+        # See: https://stackoverflow.com/a/17050613/1316276.
+        drop_ind = np.nonzero(blockee_mask)[0][further]
+        drop_mask[drop_ind] = (less_thresh & closer_point).any(1)
 
     return drop_mask
 
@@ -93,52 +140,68 @@ def unocclude(new_points, env_vars: P2PEnv):
     elevs = env_vars.elevs
 
     point_angles = np.arctan2(new_points[:, 1], new_points[:, 0])
-    min_azim = point_angles.min() - env_vars.azim_pm
-    max_azim = point_angles.max() + env_vars.azim_pm
-    azims = azims[(min_azim < azims) & (azims < max_azim)]
-    elev_azims = np.stack(np.meshgrid(-elevs, azims)).transpose(1, 2, 0).reshape(-1, 2)
-    Rs = Rotation.from_euler("yz", elev_azims).as_matrix()
+    min_angle = point_angles.min() - env_vars.azim_pm
+    max_angle = point_angles.max() + env_vars.azim_pm
 
-    Ps = new_points
-    Ds = Rs @ env_vars.fwd
-    t_Ps = Ds @ Ps.T
-    ray_dists = (np.linalg.norm(Ps, axis=1) ** 2 - t_Ps**2) ** 0.5
+    all_final_points = []
+    max_sector_angle = env_vars.max_sector_angle
+    for start_angle in np.arange(min_angle, max_angle, max_sector_angle):
+        end_angle = min(max_angle, start_angle + max_sector_angle)
 
-    # Average closest points.
-    closest_ray_dists = ray_dists.argsort(1)
-    ray_dists[ray_dists >= env_vars.hit_thresh] = np.inf
-    final_points = np.zeros((len(t_Ps), env_vars.neighbors, 3))
-    final_dists = np.full((len(t_Ps), env_vars.neighbors), -1.0)
-    total_points = np.zeros(len(t_Ps))
-    idxs = np.arange(len(t_Ps))
-    for neighbor in range(min(env_vars.neighbors, ray_dists.shape[1])):
-        min_Ps = closest_ray_dists[:, neighbor]
-        dists = ray_dists[idxs, min_Ps]
-        keep = dists < env_vars.hit_thresh
-        total_points[keep] += 1
-        final_points[:, neighbor] = t_Ps[idxs, min_Ps][:, None] * Ds
-        final_dists[:, neighbor] = dists
+        in_sector_azims = (start_angle < azims) & (azims < end_angle)
+        sector_azims = azims[in_sector_azims]
+        if len(sector_azims) == 0:
+            continue
 
-    keep = total_points > 0
-    final_points = final_points[keep]
-    final_dists = final_dists[keep]
-    weights = np.zeros_like(final_dists)
-    two_neighbors = (final_dists > 0).all(1)
-    weights[two_neighbors] = 0.5
-    weights[~two_neighbors, 0] = 1
-    final_points = np.einsum("dnc,dn->dc", final_points, weights)
-    two_neighbors = (weights > 0).all(1)
-    very_close = (final_dists < env_vars.hit_thresh / 2).any(1)
-    final_points = final_points[very_close | two_neighbors]
-    final_points = final_points[~(final_points == 0).all(1)]
+        elev_azims = np.stack(np.meshgrid(-elevs, sector_azims))
+        elev_azims = elev_azims.transpose(1, 2, 0).reshape(-1, 2)
+        Rs = Rotation.from_euler("yz", elev_azims).as_matrix()
+
+        start_angle -= env_vars.azim_pm
+        end_angle += env_vars.azim_pm
+
+        in_sector_points = (start_angle < point_angles) & (point_angles < end_angle)
+        Ps = new_points[in_sector_points]
+        Ds = Rs @ env_vars.fwd
+        t_Ps = Ds @ Ps.T
+        ray_dists = (np.linalg.norm(Ps, axis=1) ** 2 - t_Ps**2) ** 0.5
+
+        # Average closest points.
+        closest_ray_dists = ray_dists.argsort(1)
+        ray_dists[ray_dists >= env_vars.hit_thresh] = np.inf
+        final_points = np.zeros((len(t_Ps), env_vars.neighbors, 3))
+        final_dists = np.full((len(t_Ps), env_vars.neighbors), -1.0)
+        total_points = np.zeros(len(t_Ps))
+        idxs = np.arange(len(t_Ps))
+        # Sometimes there's only a single object point in the sector.
+        neighbors = min(env_vars.neighbors, closest_ray_dists.shape[1])
+        for neighbor in range(neighbors):
+            min_Ps = closest_ray_dists[:, neighbor]
+            dists = ray_dists[idxs, min_Ps]
+            keep = dists < env_vars.hit_thresh
+            total_points[keep] += 1
+            final_points[:, neighbor] = t_Ps[idxs, min_Ps][:, None] * Ds
+            final_dists[:, neighbor] = dists
+
+        keep = total_points > 0
+        final_points = final_points[keep]
+        final_dists = final_dists[keep]
+        weights = np.zeros_like(final_dists)
+        two_neighbors = (final_dists > 0).all(1)
+        weights[two_neighbors] = 0.5
+        weights[~two_neighbors, 0] = 1
+        final_points = np.einsum("dnc,dn->dc", final_points, weights)
+        very_close = (final_dists < env_vars.hit_thresh / 2).any(1)
+        final_points = final_points[very_close | two_neighbors]
+        final_points = final_points[~(final_points == 0).all(1)]
+        all_final_points.append(final_points)
+
+    final_points = np.concatenate(all_final_points)
 
     return final_points
 
 
 def simulate_scene(background_object_points, background_points, env_vars: P2PEnv):
-    # Occlude object points with background points. See:
-    # https://math.stackexchange.com/a/2599689/614328.
-
     # The points from the Ouster are in the "Sensor Coordinate Frame" by default, so we
     # have to shift the z coordinates.
     # See: https://static.ouster.dev/sdk-docs/python/api/client.html?highlight=xyzlut#ouster.client.XYZLut
@@ -146,49 +209,25 @@ def simulate_scene(background_object_points, background_points, env_vars: P2PEnv
     background_object_points = background_object_points + env_vars.sensor2lidar
     background_points = background_points + env_vars.sensor2lidar
 
-    # Only consider background points that are in the same cylindrical slice as the object
-    # (+/- a few degrees).
-    object_angles = np.arctan2(
-        background_object_points[:, 1], background_object_points[:, 0]
-    )
-    (min_angle, max_angle) = (object_angles.min(), object_angles.max())
-    min_angle -= env_vars.azim_pm
-    max_angle += env_vars.azim_pm
-    background_angles = np.arctan2(background_points[:, 1], background_points[:, 0])
-    in_cyl = (min_angle < background_angles) & (background_angles < max_angle)
-    in_cyl_background_points = background_points[in_cyl]
-
-    obj_norms = np.linalg.norm(background_object_points, axis=1)
-    in_cyl_norms = np.linalg.norm(in_cyl_background_points, axis=1)
-
     # Occlude background points with object points.
-    further = in_cyl_norms >= obj_norms.min()
-    further_background_points = in_cyl_background_points[further]
-    further_norms = in_cyl_norms[further]
     drop_mask = block(
-        further_background_points,
-        further_norms,
+        background_points,
         background_object_points,
-        obj_norms,
+        env_vars.max_sector_angle,
+        env_vars.azim_pm,
         env_vars.occlude_background_thresh,
     )
-    occluded_background_idxs = np.arange(len(background_points))[in_cyl][further][
-        drop_mask
-    ]
+    occluded_background_idxs = np.arange(len(background_points))[drop_mask]
 
     # Get simulated point cloud based on position relative to sensor.
     unoccluded_points = unocclude(background_object_points, env_vars)
 
     # Occlude object points with background points.
-    unoccluded_norms = np.linalg.norm(unoccluded_points, axis=1)
-    closer = in_cyl_norms <= obj_norms.max()
-    closer_background_points = in_cyl_background_points[closer]
-    closer_norms = in_cyl_norms[closer]
     drop_mask = block(
         unoccluded_points,
-        unoccluded_norms,
-        closer_background_points,
-        closer_norms,
+        background_points,
+        env_vars.max_sector_angle,
+        env_vars.azim_pm,
         env_vars.occlude_object_thresh,
     )
     simulated_object_points = unoccluded_points[~drop_mask] - env_vars.sensor2lidar
