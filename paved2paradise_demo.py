@@ -19,15 +19,8 @@ BBOX_COLOR = [1, 0, 0]
 GRID_COLOR = [0.5, 0.5, 0.5]
 CYL_RADIUS = 0.05
 
-# The maximum number of close object points to a ray that are used to estimate the
-# surface point of an object.
-NEIGHBORS = 2
-
 # The forward vector of the Ouster sensor.
 FWD = np.array([1, 0, 0])
-
-# The maximum angle slice for a sector when occluding points.
-MAX_SECTOR_ANGLE = np.radians(2.25)
 
 
 def color_by_dist(pcd):
@@ -88,6 +81,7 @@ class Paved2Paradise:
         self.bg_x_range = (0, 13)
         self.bg_y_range = (-5.625, 5.625)
         self.new_obj_xy = np.array([9.98, 1.19])
+        self.level_at_location = True
         self.in_obj_xy = self.new_obj_xy.copy()
         self.grids_info = {
             "obj": {"length": 7, "width": 6},
@@ -101,6 +95,8 @@ class Paved2Paradise:
         self.hit_thresh = 0.04
         self.occlude_obj_thresh = 0.04
         self.occlude_bg_thresh = 0.03
+        self.max_sector_angle = 2.25
+        self.neighbors = 2
         self.elev_range = (-22.5, 22.5)
         self.elev_res = 128
         self.azim_res = 2048
@@ -170,7 +166,7 @@ class Paved2Paradise:
         bg_x_range.set_on_value_changed(self._on_bg_x_range_changed)
         bg_x_range.text_value = str(self.bg_x_range)
 
-        bg_y_range_label = gui.Label("Object y Range (m)")
+        bg_y_range_label = gui.Label("Background y Range (m)")
         bg_y_range = gui.TextEdit()
         bg_y_range.set_on_value_changed(self._on_bg_y_range_changed)
         bg_y_range.text_value = str(self.bg_y_range)
@@ -206,23 +202,27 @@ class Paved2Paradise:
 
         level_obj = gui.Checkbox("Level Object")
         level_obj.set_on_checked(self._on_level_object)
-        level_obj.checked = True
+        level_obj.checked = self.show_level_pcds["obj"]
 
         level_bg = gui.Checkbox("Level Background")
         level_bg.set_on_checked(self._on_level_background)
-        level_bg.checked = True
+        level_bg.checked = self.show_level_pcds["bg"]
+
+        level_loc = gui.Checkbox("Level at Object Location")
+        level_loc.set_on_checked(self._on_level_location)
+        level_loc.checked = self.level_at_location
 
         occlude = gui.Checkbox("Occlude")
-        occlude.checked = True
         occlude.set_on_checked(self._on_occlude)
+        occlude.checked = self.occlude
 
         sim_lidar = gui.Checkbox("Simulate LiDAR")
-        sim_lidar.checked = True
         sim_lidar.set_on_checked(self._on_sim_lidar)
+        sim_lidar.checked = self.sim_lidar
 
         show_new_obj_loc = gui.Checkbox("New Object Location")
-        show_new_obj_loc.checked = True
         show_new_obj_loc.set_on_checked(self._on_show_new_obj_loc)
+        show_new_obj_loc.checked = self.show_new_obj_loc
 
         show_sector = gui.Checkbox("Sector")
         show_sector.set_on_checked(self._on_show_sector)
@@ -234,6 +234,7 @@ class Paved2Paradise:
         v.add_child(obj_y)
         v.add_child(level_obj)
         v.add_child(level_bg)
+        v.add_child(level_loc)
         v.add_child(occlude)
         v.add_child(sim_lidar)
         v.add_child(show_new_obj_loc)
@@ -325,6 +326,16 @@ class Paved2Paradise:
         occlude_bg_thresh.set_on_value_changed(self._on_occlude_bg_thresh_changed)
         occlude_bg_thresh.text_value = str(self.occlude_bg_thresh)
 
+        max_sector_label = gui.Label("Maximum Sector (°)")
+        max_sector = gui.TextEdit()
+        max_sector.set_on_value_changed(self._on_max_sector_changed)
+        max_sector.text_value = str(self.max_sector_angle)
+
+        neighbors_label = gui.Label("Neighbors")
+        neighbors = gui.TextEdit()
+        neighbors.set_on_value_changed(self._on_neighbors_changed)
+        neighbors.text_value = str(self.neighbors)
+
         elev_range_label = gui.Label("Elevation Range (°)")
         elev_range = gui.TextEdit()
         elev_range.set_on_value_changed(self._on_elev_range_changed)
@@ -352,6 +363,10 @@ class Paved2Paradise:
         v.add_child(occlude_obj_thresh)
         v.add_child(occlude_bg_label)
         v.add_child(occlude_bg_thresh)
+        v.add_child(max_sector_label)
+        v.add_child(max_sector)
+        v.add_child(neighbors_label)
+        v.add_child(neighbors)
         v.add_child(elev_range_label)
         v.add_child(elev_range)
         v.add_child(elev_res_label)
@@ -634,15 +649,24 @@ class Paved2Paradise:
         self.render_bg_scene()
         self.simulate_scene()
 
-    def level_scene(self, which):
-        points = np.array(self.pcds[which].points)
+    def get_grid_xy(self, which):
         if which == "obj":
             grid_x = self.obj_bbox.center[0]
             grid_y = self.obj_bbox.center[1]
         else:
-            grid_x = self.new_obj_xy[0]
-            grid_y = self.new_obj_xy[1]
+            if self.level_at_location:
+                grid_x = self.new_obj_xy[0]
+                grid_y = self.new_obj_xy[1]
+            else:
+                grid_x = self.grids_info[which]["length"] / 2
+                grid_y = 0
 
+        return (grid_x, grid_y)
+
+    def level_scene(self, which):
+        points = np.array(self.pcds[which].points)
+
+        grid_x, grid_y = self.get_grid_xy(which)
         x_start = grid_x - self.grids_info[which]["length"] / 2
         x_end = x_start + self.grids_info[which]["length"]
         y_start = grid_y - self.grids_info[which]["width"] / 2
@@ -712,6 +736,14 @@ class Paved2Paradise:
         self.render_bg_scene()
         self.simulate_scene()
 
+    def _on_level_location(self, level_loc):
+        self.level_at_location = level_loc
+        self.create_ground_plane("bg")
+        self.create_grid_points("bg")
+        self.level_scene("bg")
+        self.render_bg_scene()
+        self.simulate_scene()
+
     def _on_occlude(self, occlude):
         self.occlude = occlude
         self.simulate_scene()
@@ -731,17 +763,12 @@ class Paved2Paradise:
 
     def create_grid_points(self, which):
         points = np.array(self.pcds[which].points)
-        if which == "obj":
-            x = self.obj_bbox.center[0]
-            y = self.obj_bbox.center[1]
-        else:
-            x = self.new_obj_xy[0]
-            y = self.new_obj_xy[1]
 
-        x_start = x - self.grids_info[which]["length"] / 2
+        (grid_x, grid_y) = self.get_grid_xy(which)
+        x_start = grid_x - self.grids_info[which]["length"] / 2
         x_end = x_start + self.grids_info[which]["length"]
         in_x = (x_start < points[:, 0]) & (points[:, 0] < x_end)
-        y_start = y - self.grids_info[which]["width"] / 2
+        y_start = grid_y - self.grids_info[which]["width"] / 2
         y_end = y_start + self.grids_info[which]["width"]
         in_y = (y_start < points[:, 1]) & (points[:, 1] < y_end)
         region_points = points[in_x & in_y]
@@ -764,13 +791,7 @@ class Paved2Paradise:
         ground_plane = o3d.geometry.TriangleMesh.create_box(
             width=grid_length, height=grid_width, depth=0.01
         )
-        if which == "obj":
-            grid_x = self.obj_bbox.center[0]
-            grid_y = self.obj_bbox.center[1]
-        else:
-            grid_x = self.new_obj_xy[0]
-            grid_y = self.new_obj_xy[1]
-
+        (grid_x, grid_y) = self.get_grid_xy(which)
         center = np.array([grid_x, grid_y, 0])
         ground_plane.translate(center, relative=False)
 
@@ -900,6 +921,24 @@ class Paved2Paradise:
 
         self.simulate_scene()
 
+    def _on_max_sector_changed(self, max_sector_angle):
+        try:
+            self.max_sector_angle = float(max_sector_angle)
+        except ValueError:
+            self._create_dialog("Input Error", "Maximum Sector must be a float.")
+            return
+
+        self.simulate_scene()
+
+    def _on_neighbors_changed(self, neighbors):
+        try:
+            self.neighbors = int(neighbors)
+        except ValueError:
+            self._create_dialog("Input Error", "Neighbors must be an integer.")
+            return
+
+        self.simulate_scene()
+
     def _on_elev_range_changed(self, elev_range):
         try:
             self.elev_range = eval(elev_range)
@@ -958,10 +997,11 @@ class Paved2Paradise:
         if max_angle <= min_angle:
             return drop_mask
 
-        for start_angle in np.arange(min_angle, max_angle, MAX_SECTOR_ANGLE):
+        max_sector_angle = np.radians(self.max_sector_angle)
+        for start_angle in np.arange(min_angle, max_angle, max_sector_angle):
             # Only consider points that are in the same cylindrical slice (+/- a few
             # degrees).
-            end_angle = min(max_angle, start_angle + MAX_SECTOR_ANGLE)
+            end_angle = min(max_angle, start_angle + max_sector_angle)
             blockee_mask = (start_angle < blockee_angles) & (blockee_angles < end_angle)
             in_cyl_blockee = blockee[blockee_mask]
             in_cyl_blockee_norms = np.linalg.norm(in_cyl_blockee, axis=1)
@@ -1010,7 +1050,7 @@ class Paved2Paradise:
         (min_elev, max_elev) = np.deg2rad(self.elev_range)
         elevs = np.linspace(min_elev, max_elev, self.elev_res)
         all_final_points = []
-        max_sector_angle = MAX_SECTOR_ANGLE
+        max_sector_angle = np.radians(self.max_sector_angle)
         for start_angle in np.arange(min_angle, max_angle, max_sector_angle):
             end_angle = min(max_angle, start_angle + max_sector_angle)
 
@@ -1034,12 +1074,12 @@ class Paved2Paradise:
             # Average closest points.
             closest_ray_dists = ray_dists.argsort(1)
             ray_dists[ray_dists >= self.hit_thresh] = np.inf
-            final_points = np.zeros((len(t_Ps), NEIGHBORS, 3))
-            final_dists = np.full((len(t_Ps), NEIGHBORS), -1.0)
+            final_points = np.zeros((len(t_Ps), self.neighbors, 3))
+            final_dists = np.full((len(t_Ps), self.neighbors), -1.0)
             total_points = np.zeros(len(t_Ps))
             idxs = np.arange(len(t_Ps))
             # Sometimes there's only a single object point in the sector.
-            neighbors = min(NEIGHBORS, closest_ray_dists.shape[1])
+            neighbors = min(self.neighbors, closest_ray_dists.shape[1])
             for neighbor in range(neighbors):
                 min_Ps = closest_ray_dists[:, neighbor]
                 dists = ray_dists[idxs, min_Ps]
@@ -1052,12 +1092,13 @@ class Paved2Paradise:
             final_points = final_points[keep]
             final_dists = final_dists[keep]
             weights = np.zeros_like(final_dists)
-            two_neighbors = (final_dists > 0).all(1)
-            weights[two_neighbors] = 0.5
-            weights[~two_neighbors, 0] = 1
+            n_neighbors = (final_dists > 0).sum(1)
+            for neighbor in range(1, n_neighbors.max() + 1):
+                weights[n_neighbors == neighbor] = 1 / neighbor
+
             final_points = np.einsum("dnc,dn->dc", final_points, weights)
             very_close = (final_dists < self.hit_thresh / 2).any(1)
-            final_points = final_points[very_close | two_neighbors]
+            final_points = final_points[very_close | (n_neighbors > 1)]
             final_points = final_points[~(final_points == 0).all(1)]
             all_final_points.append(final_points)
 
@@ -1091,6 +1132,7 @@ class Paved2Paradise:
             (background_object_points, bbox) = move_object_to_position(
                 object_points, bbox, self.new_obj_xy
             )
+
         else:
             background_object_points = object_points
 
@@ -1109,8 +1151,11 @@ class Paved2Paradise:
         background_points = np.array(self.pcds["bg"].points) + self.sensor2lidar
 
         if self.sim_lidar:
-            # Get simulated point cloud based on position relative to sensor.
-            unoccluded_points = self.unocclude(background_object_points)
+            if len(background_object_points) == 0:
+                unoccluded_points = np.zeros((1, 3))
+            else:
+                # Get simulated point cloud based on position relative to sensor.
+                unoccluded_points = self.unocclude(background_object_points)
 
         else:
             unoccluded_points = background_object_points
