@@ -980,6 +980,10 @@ class Paved2Paradise:
         self.simulate_scene()
 
     def block(self, blockee, blocker, azim_pm, occlude_thresh):
+        drop_mask = np.zeros(len(blockee), dtype=bool)
+        if (len(blockee) == 0) or (len(blocker) == 0):
+            return drop_mask
+
         # Occlude blockee points with blocker points. See:
         # https://math.stackexchange.com/a/2599689/614328.
         blockee_angles = np.arctan2(blockee[:, 1], blockee[:, 0])
@@ -992,7 +996,6 @@ class Paved2Paradise:
 
         min_angle = max(blockee_min_angle, blocker_min_angle)
         max_angle = min(blockee_max_angle, blocker_max_angle)
-        drop_mask = np.zeros(len(blockee), dtype=bool)
         # No overlap between the two point clouds.
         if max_angle <= min_angle:
             return drop_mask
@@ -1090,6 +1093,9 @@ class Paved2Paradise:
 
             keep = total_points > 0
             final_points = final_points[keep]
+            if len(final_points) == 0:
+                continue
+
             final_dists = final_dists[keep]
             weights = np.zeros_like(final_dists)
             n_neighbors = (final_dists > 0).sum(1)
@@ -1102,7 +1108,10 @@ class Paved2Paradise:
             final_points = final_points[~(final_points == 0).all(1)]
             all_final_points.append(final_points)
 
-        return np.concatenate(all_final_points)
+        if len(all_final_points) == 0:
+            return np.empty((0, 3))
+        else:
+            return np.concatenate(all_final_points)
 
     def simulate_scene(self):
         if not (("obj" in self.pcds) and ("bg" in self.pcds)):
