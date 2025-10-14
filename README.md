@@ -51,7 +51,7 @@ pip3 install -r requirements.txt
 To run:
 
 ```bash
-python3 paved2paradise_demo.py
+python3 paved2paradise.py
 ```
 
-When loading a new object scene PCD, the application expects there to be a JSON file located in the same directory with the same filename prefix that defines the object's bounding box (see [`parking_lot.json`](parking_lot.json) for an example).
+When loading a new object scene PCD, the application expects there to be a JSON file located in the same directory with the same filename prefix that defines the object's bounding box (see [`human_colored.json`](human_colored.json) for an example).
