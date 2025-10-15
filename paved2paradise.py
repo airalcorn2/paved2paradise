@@ -830,8 +830,6 @@ class Paved2Paradise:
             img = Image.fromarray((255 * destaggered_colors).astype("uint8"))
             img.show()
 
-        self.close_img = img
-
         self._on_bg_xy_range_changed()
         self.simulate_scene()
 
@@ -960,6 +958,7 @@ class Paved2Paradise:
         depth_img = 255 * bg_range_image[..., 4] / bg_range_image[..., 4].max()
         img = Image.fromarray(depth_img.astype("uint8"))
         img.show()
+        self.close_img = img
 
         self.create_grid_points("bg")
         self.create_ground_plane("bg")
@@ -1600,14 +1599,13 @@ class Paved2Paradise:
             self.beams,
             self.bg_min_dist,
             1,
-        )[..., 4]
-        image = 255 * range_image / range_image.max()
+        )
+        depth_img = range_image[..., 4]
+        image = 255 * depth_img / depth_img.max()
         img = Image.fromarray(image.astype("uint8"))
         img.show()
 
-        diff_image = image / 255 - np.array(self.close_img) / 255
-        diff_image = np.abs(diff_image)
-        diff_image = 255 * (diff_image / diff_image.max())
+        diff_image = image * (range_image[..., 0] == 1)
         diff_img = Image.fromarray(diff_image.astype("uint8"))
         diff_img.show()
         self.close_img.show()
