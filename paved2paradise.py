@@ -318,6 +318,7 @@ class Paved2Paradise:
         self.final_pcd = o3d.geometry.PointCloud()
         self.simulated_object_points = None
         self.close_img = None
+        self.og_bg_range_image = None
         self.bg_range_image = None
 
     def run(self):
@@ -806,7 +807,7 @@ class Paved2Paradise:
             )
 
         destaggered_depths = np.linalg.norm(destaggered_points, axis=2)
-        self.bg_range_image = np.concatenate(
+        self.og_bg_range_image = np.concatenate(
             [destaggered_points, destaggered_depths[..., None]], axis=2
         )
 
@@ -823,30 +824,13 @@ class Paved2Paradise:
                     colors[v], self.pixel_shift_by_row[v], axis=0
                 )
 
-            self.bg_range_image = np.concatenate(
-                [self.bg_range_image, destaggered_colors], axis=2
+            self.og_bg_range_image = np.concatenate(
+                [self.og_bg_range_image, destaggered_colors], axis=2
             )
             img = Image.fromarray((255 * destaggered_colors).astype("uint8"))
             img.show()
 
-        in_x = (self.bg_x_range[0] < destaggered_points[..., 0]) & (
-            destaggered_points[..., 0] < self.bg_x_range[1]
-        )
-        in_y = (self.bg_y_range[0] < destaggered_points[..., 1]) & (
-            destaggered_points[..., 1] < self.bg_y_range[1]
-        )
-        destaggered_depths[~(in_x & in_y)] = 0
-        self.bg_range_image[~(in_x & in_y)] = 0
-        destaggered = 255 * destaggered_depths / destaggered_depths.max()
-        img = Image.fromarray(destaggered.astype("uint8"))
-        img.show()
-
         self.close_img = img
-
-        dims = 1 + self.bg_range_image.shape[2]
-        bg_range_image = np.zeros((self.height, self.width, dims), dtype="float64")
-        bg_range_image[..., 1:] = self.bg_range_image
-        self.bg_range_image = bg_range_image
 
         self._on_bg_xy_range_changed()
         self.simulate_scene()
@@ -960,6 +944,22 @@ class Paved2Paradise:
         if self.bg_window.scene.camera.get_field_of_view() == 90.0:
             bbox = self.bg_window.scene.bounding_box
             self.bg_window.setup_camera(60.0, bbox, bbox.get_center())
+
+        dims = 1 + self.og_bg_range_image.shape[2]
+        bg_range_image = np.zeros((self.height, self.width, dims), dtype="float64")
+        bg_range_image[..., 1:] = self.og_bg_range_image
+
+        in_x = (self.bg_x_range[0] < bg_range_image[..., 1]) & (
+            bg_range_image[..., 1] < self.bg_x_range[1]
+        )
+        in_y = (self.bg_y_range[0] < bg_range_image[..., 2]) & (
+            bg_range_image[..., 2] < self.bg_y_range[1]
+        )
+        bg_range_image[~(in_x & in_y)] = 0
+        self.bg_range_image = bg_range_image
+        depth_img = 255 * bg_range_image[..., 4] / bg_range_image[..., 4].max()
+        img = Image.fromarray(depth_img.astype("uint8"))
+        img.show()
 
         self.create_grid_points("bg")
         self.create_ground_plane("bg")
