@@ -29,6 +29,12 @@ DEFAULT_OBJ_F = "./human_colored.pcd"
 DEFAULT_BG_F = "./orchard_colored.pcd"
 
 
+def create_depth_image(depths, max_depth):
+    depths[depths == 0] = max_depth
+    depth_image = 255 * (1 - depths / max_depth)
+    return Image.fromarray(depth_image.astype("uint8"))
+
+
 def color_by_dist(pcd):
     pcd_points = np.array(pcd.points)
     col_vals = np.linalg.norm(pcd_points, axis=1)
@@ -223,7 +229,7 @@ def project_points(
         elif v > height - 1:
             v = height - 1
 
-        old_depth = range_image[v, u, 3]
+        old_depth = range_image[v, u, 4]
         if (old_depth < bg_min_dist) or (depth < old_depth):
             range_image[v, u, 0] = obj_idx
             range_image[v, u, 1] = x
@@ -796,8 +802,7 @@ class Paved2Paradise:
         points = points.reshape(self.height, self.width, 3)
 
         depths = np.linalg.norm(points, axis=2)
-        staggered = 255 * depths / depths.max()
-        img = Image.fromarray(staggered.astype("uint8"))
+        img = create_depth_image(depths, depths.max())
         img.show()
 
         destaggered_points = np.zeros_like(points)
@@ -811,8 +816,7 @@ class Paved2Paradise:
             [destaggered_points, destaggered_depths[..., None]], axis=2
         )
 
-        destaggered = 255 * destaggered_depths / destaggered_depths.max()
-        img = Image.fromarray(destaggered.astype("uint8"))
+        img = create_depth_image(destaggered_depths, destaggered_depths.max())
         img.show()
 
         if self.bg_pcd.has_colors():
@@ -955,8 +959,7 @@ class Paved2Paradise:
         )
         bg_range_image[~(in_x & in_y)] = 0
         self.bg_range_image = bg_range_image
-        depth_img = 255 * bg_range_image[..., 4] / bg_range_image[..., 4].max()
-        img = Image.fromarray(depth_img.astype("uint8"))
+        img = create_depth_image(bg_range_image[..., 4], bg_range_image[..., 4].max())
         img.show()
         self.close_img = img
 
@@ -1378,8 +1381,7 @@ class Paved2Paradise:
             self.bg_min_dist,
             1,
         )[..., 4]
-        image = 255 * range_image / range_image.max()
-        img = Image.fromarray(image.astype("uint8"))
+        img = create_depth_image(range_image, self.bg_range_image[..., 4].max())
         img.show()
 
         for idx in range(self.prev_n_beams):
@@ -1600,12 +1602,10 @@ class Paved2Paradise:
             self.bg_min_dist,
             1,
         )
-        depth_img = range_image[..., 4]
-        image = 255 * depth_img / depth_img.max()
-        img = Image.fromarray(image.astype("uint8"))
+        img = create_depth_image(range_image[..., 4], range_image[..., 4].max())
         img.show()
 
-        diff_image = image * (range_image[..., 0] == 1)
+        diff_image = np.array(img) * (range_image[..., 0] == 1)
         diff_img = Image.fromarray(diff_image.astype("uint8"))
         diff_img.show()
         self.close_img.show()
