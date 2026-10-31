@@ -1,22 +1,38 @@
+"""Interactive Open3D GUI for exploring the Paved2Paradise LiDAR augmentation pipeline.
+
+Loads an "object" point cloud (e.g., a person) and a "background" point cloud (e.g.,
+an orchard), lets the user interactively place the object in the background scene,
+and simulates how the combined scene would look from the LiDAR sensor's perspective
+-- including which points on the object a beam would actually hit and which object
+points are occluded by the background. See core.py for the underlying augmentation
+algorithm.
+"""
+
+import ast
 import copy
 import json
-import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import open3d as o3d
 import os
 
+from core import move_object_to_position, project_points, unlevel, unocclude
 from lidar2intrinsics import lidar2intrinsics
-from numba import float64, int64, njit
-from open3d.visualization import gui, rendering
+from matplotlib.colors import Normalize
+from open3d.visualization import gui
+# open3d's stubs don't declare the "rendering" submodule in some versions.
+from open3d.visualization import rendering  # pyright: ignore[reportAttributeAccessIssue]
 from PIL import Image
 from scipy.spatial.transform import Rotation
 from sklearn.neighbors import NearestNeighbors
+from typing import Literal, cast
+
+Which = Literal["obj", "bg"]
 
 # Visualization stuff.
 VMIN = 0
 VMAX = 12
-CMAP_NORM = mpl.colors.Normalize(vmin=VMIN, vmax=VMAX)
+CMAP_NORM = Normalize(vmin=VMIN, vmax=VMAX)
 COLORMAP = "RdYlGn"
 CMAP = plt.get_cmap(COLORMAP)
 BBOX_COLOR = [1, 0, 0]
@@ -29,223 +45,39 @@ DEFAULT_OBJ_F = "./human_colored.pcd"
 DEFAULT_BG_F = "./orchard_colored.pcd"
 
 
-def create_depth_image(depths, max_depth):
+def create_depth_image(depths: np.ndarray, max_depth: float) -> Image.Image:
+    """Render a depth map (in meters) as a grayscale image, near is bright."""
     depths[depths == 0] = max_depth
     depth_image = 255 * (1 - depths / max_depth)
     return Image.fromarray(depth_image.astype("uint8"))
 
 
-def color_by_dist(pcd):
+def color_by_dist(pcd: o3d.geometry.PointCloud) -> None:
+    """Color a point cloud's points by their distance from the sensor origin."""
     pcd_points = np.array(pcd.points)
     col_vals = np.linalg.norm(pcd_points, axis=1)
     point_colors = CMAP(CMAP_NORM(col_vals))[:, :3]
     pcd.colors = o3d.utility.Vector3dVector(point_colors)
 
 
-def move_object_to_position(points, bbox, xy):
-    object_angle = np.arctan2(bbox.center[1], bbox.center[0])
-    new_angle = np.arctan2(xy[1], xy[0])
-    rot_angle = new_angle - object_angle
-    R = Rotation.from_euler("Z", rot_angle).as_matrix()
-
-    xy_dist = np.linalg.norm(xy)
-    bbox_dir = xy / xy_dist
-    bbox_dir = np.array(list(bbox_dir) + [0])
-    shift = xy_dist - np.linalg.norm(bbox.center[:2])
-    new_points = (R @ points.T).T + shift * bbox_dir
-
-    new_center = np.array(list(xy) + [bbox.center[2]])
-    new_R = R @ bbox.R
-    bbox = o3d.geometry.OrientedBoundingBox(new_center, new_R, bbox.extent)
-    bbox.color = BBOX_COLOR
-
-    return (new_points, bbox)
-
-
-def unlevel(moved_object_points, bg_t, bg_R, moved_bbox):
-    moved_object_points += bg_t
-    moved_object_points = (bg_R.T @ moved_object_points.T).T
-    moved_center = bg_R.T @ (moved_bbox.center + bg_t)
-    moved_bbox_R = bg_R.T @ moved_bbox.R
-
-    return (moved_object_points, moved_center, moved_bbox_R)
-
-
-def unocclude(
-    object_points,
-    optical_center,
-    azim_pm,
-    elev_pm,
-    D_elevs,
-    max_sector_angle,
-    D_azims,
-    all_Ds,
-    hit_thresh,
-    max_neighbors,
-):
-    # The points from the Ouster are in the "Sensor Coordinate Frame" by default, so
-    # we have to translate the points relative to the sensor's origin.
-    # See: https://static.ouster.dev/sdk-docs/python/api/client.html#ouster.sdk.client.XYZLut
-    # and: https://static.ouster.dev/sensor-docs/image_route1/image_route2/sensor_data/sensor-data.html#sensor-coordinate-frame.
-    object_points[:, :3] -= optical_center
-
-    point_azims = np.arctan2(object_points[:, 1], object_points[:, 0])
-    min_azim = point_azims.min() - azim_pm
-    max_azim = point_azims.max() + azim_pm
-
-    point_norms = np.linalg.norm(object_points[:, :3], axis=1)
-    point_elevs = np.arcsin(object_points[:, 2] / point_norms)
-    min_elev = point_elevs.min() - elev_pm
-    max_elev = point_elevs.max() + elev_pm
-    elev_mask = (min_elev < D_elevs) & (D_elevs < max_elev)
-
-    all_final_points = []
-    max_sector_angle = np.radians(max_sector_angle)
-    for start_angle in np.arange(min_azim, max_azim, max_sector_angle):
-        # Only consider beams that are in the same cylindrical slice (+/- a few
-        # degrees).
-        end_angle = min(max_azim, start_angle + max_sector_angle)
-        azim_mask = (start_angle < D_azims) & (D_azims < end_angle)
-        Ds = all_Ds[azim_mask & elev_mask]
-        if len(Ds) == 0:
-            continue
-
-        start_angle -= azim_pm
-        end_angle += azim_pm
-
-        in_slice = (start_angle < point_azims) & (point_azims < end_angle)
-        Ps = object_points[in_slice, :3]
-        t_Ps = Ds @ Ps.T
-        ray_dists = (np.linalg.norm(Ps, axis=1) ** 2 - t_Ps**2) ** 0.5
-
-        # Average closest points.
-        closest_ray_dists = ray_dists.argsort(1)
-        ray_dists[ray_dists >= hit_thresh] = np.inf
-        final_points = np.zeros((len(t_Ps), max_neighbors, object_points.shape[1]))
-        final_dists = np.full((len(t_Ps), max_neighbors), -1.0)
-        total_points = np.zeros(len(t_Ps))
-        idxs = np.arange(len(t_Ps))
-        # Sometimes there's only a single object point in the sector.
-        neighbors = min(max_neighbors, closest_ray_dists.shape[1])
-        for neighbor in range(neighbors):
-            min_Ps = closest_ray_dists[:, neighbor]
-            dists = ray_dists[idxs, min_Ps]
-            keep = dists < hit_thresh
-            total_points[keep] += 1
-            final_points[:, neighbor, :3] = t_Ps[idxs, min_Ps][:, None] * Ds
-            if object_points.shape[1] > 3:
-                final_points[:, neighbor, 3:] = object_points[in_slice][min_Ps, 3:]
-
-            final_dists[:, neighbor] = dists
-
-        keep = total_points > 0
-        final_points = final_points[keep]
-        if len(final_points) == 0:
-            continue
-
-        final_dists = final_dists[keep]
-        weights = np.zeros_like(final_dists)
-        n_neighbors = (final_dists > 0).sum(1)
-        for neighbor in range(1, n_neighbors.max() + 1):
-            weights[n_neighbors == neighbor] = 1 / neighbor
-
-        final_points = np.einsum("dnc,dn->dc", final_points, weights)
-        very_close = (final_dists < hit_thresh / 2).any(1)
-        final_points = final_points[very_close | (n_neighbors > 1)]
-        final_points = final_points[~(final_points == 0).all(1)]
-        all_final_points.append(final_points)
-
-    if len(all_final_points) == 0:
-        return np.empty((0, object_points.shape[1]))
-    else:
-        all_final_points = np.concatenate(all_final_points)
-        all_final_points[:, :3] += optical_center
-        return all_final_points
-
-
-@njit(
-    # range_image
-    float64[:, :, :](
-        float64[:, :, :],  # range_image
-        float64[:, :],  # points
-        int64,  # height
-        int64,  # width
-        float64[:, :],  # rot_mat
-        float64[:],  # optical_center
-        float64[:],  # beams
-        float64,  # bg_min_dist
-        int64,  # obj_idx
-    )
-)
-def project_points(
-    range_image,
-    points,
-    height,
-    width,
-    rot_mat,
-    optical_center,
-    beams,
-    bg_min_dist,
-    obj_idx,
-):
-    has_color = range_image.shape[2] > 5
-    (op_x, op_y, op_z) = optical_center
-    for point in points:
-        (x, y, z) = point[:3]
-        # Transform the point to the LiDAR coordinate frame.
-        og_x = rot_mat[0, 0] * x + rot_mat[0, 1] * y + rot_mat[0, 2] * z - op_x
-        og_y = rot_mat[1, 0] * x + rot_mat[1, 1] * y + rot_mat[1, 2] * z - op_y
-        og_z = rot_mat[2, 0] * x + rot_mat[2, 1] * y + rot_mat[2, 2] * z - op_z
-
-        # See Equation (1) in: "Rethinking Range View Representation for LiDAR
-        # Segmentation".
-        # The coordinate frame has the x-axis pointing forward, the y-axis pointing
-        # left, and the z-axis pointing up.
-
-        # arctan2 gives the azimuth angle in the range [-pi, pi]. Dividing by pi scales
-        # the azimuth angle to the range [-1, 1]. Subtracting from one makes it so -pi
-        # maps to two and pi maps to zero, i.e., positive angles will be on the left
-        # side of the image and negative angles will be on the right side of the image,
-        # which matches what would be seen in the real world. Multiplying by 0.5 scales
-        # the azimuth angle to the range [0, 1], and multiplying by width scales the
-        # azimuth angle to the range [0, width].
-        u = round(0.5 * (1 - np.arctan2(og_y, og_x) / np.pi) * width)
-        if u < 0:
-            u = 0
-        elif u > width - 1:
-            u = width - 1
-
-        # arcsin gives the elevation angle in the range [-pi/2, pi/2]. Subtracting
-        # min_elev shifts the range so min_elev maps to zero and max_elev maps to
-        # elev_fov. Dividing by elev_fov scales the elevation angle to the range [0, 1].
-        # Subtracting from one puts the higher elevations at the top of the image, which
-        # matches what would be seen in the real world. Multiplying by height scales the
-        # elevation angle to the range [0, height].
-        depth = np.sqrt(og_x**2 + og_y**2 + og_z**2)
-        angle = np.arcsin(og_z / depth)
-        v = np.argmin(np.abs(angle - beams))
-        if v < 0:
-            v = 0
-        elif v > height - 1:
-            v = height - 1
-
-        old_depth = range_image[v, u, 4]
-        if (old_depth < bg_min_dist) or (depth < old_depth):
-            range_image[v, u, 0] = obj_idx
-            range_image[v, u, 1] = x
-            range_image[v, u, 2] = y
-            range_image[v, u, 3] = z
-            range_image[v, u, 4] = depth
-            if has_color:
-                range_image[v, u, 5:] = point[3:]
-
-    return range_image
-
-
 class Paved2Paradise:
-    def __init__(self):
-        self.w = None
-        self.theme = None
+    """Open3D GUI application for the Paved2Paradise demo.
+
+    Three scene views are shown side by side: the object scene, the background
+    scene, and the combined/simulated scene. A settings panel on the right exposes
+    the augmentation pipeline's parameters.
+
+    Most of the object- and background-scene logic is shared, keyed by `which`
+    ("obj" or "bg") into the various `self.*` dicts (e.g., `self.pcds`,
+    `self.grid_pcds`), rather than duplicated.
+    """
+
+    def __init__(self) -> None:
+        # These are placeholders that get assigned real values before any of them are
+        # read, in run() and update_sensor_params() (both called before the event loop
+        # starts) -- the annotations document their real types for the type checker.
+        self.w: gui.Window = cast(gui.Window, None)
+        self.theme: gui.Theme = cast(gui.Theme, None)
         self.mat = rendering.MaterialRecord()
         self.mat.shader = "defaultUnlit"
         self.comb_mat = rendering.MaterialRecord()
@@ -254,52 +86,60 @@ class Paved2Paradise:
         self.bbox_mat = rendering.MaterialRecord()
         self.bbox_mat.shader = "unlitLine"
         self.bbox_mat.line_width = 2
-        self.obj_window = None
-        self.bg_window = None
-        self.comb_window = None
+        self.obj_window: gui.SceneWidget = cast(gui.SceneWidget, None)
+        self.bg_window: gui.SceneWidget = cast(gui.SceneWidget, None)
+        self.comb_window: gui.SceneWidget = cast(gui.SceneWidget, None)
 
-        self._settings_panel = None
+        self._settings_panel: gui.ScrollableVert = cast(gui.ScrollableVert, None)
 
-        self.pcds = {}
-        self.obj_pcd = None
-        self.obj_bbox = None
-        self.level_obj_bbox = None
-        self.bg_pcd = None
-        self.lidar_R = None
-        self.Rs = None
-        self.Ds = None
-        self.D_azims = None
-        self.D_elevs = None
-        self.sensor2lidar = None
-        self.optical_center = None
-        self.beams = None
-        self.azim_pm = None
-        self.elev_pm = None
-        self.height = None
-        self.width = None
-        self.pixel_shift_by_row = None
+        self.pcds: dict[Which, o3d.geometry.PointCloud] = {}
+        self.obj_pcd: o3d.geometry.PointCloud = cast(o3d.geometry.PointCloud, None)
+        self.obj_bbox: o3d.geometry.OrientedBoundingBox = cast(
+            o3d.geometry.OrientedBoundingBox, None
+        )
+        self.level_obj_bbox: o3d.geometry.OrientedBoundingBox = cast(
+            o3d.geometry.OrientedBoundingBox, None
+        )
+        self.bg_pcd: o3d.geometry.PointCloud = cast(o3d.geometry.PointCloud, None)
+        self.lidar_R: np.ndarray = cast(np.ndarray, None)
+        self.Rs: np.ndarray = cast(np.ndarray, None)
+        self.Ds: np.ndarray = cast(np.ndarray, None)
+        self.D_azims: np.ndarray = cast(np.ndarray, None)
+        self.D_elevs: np.ndarray = cast(np.ndarray, None)
+        self.sensor2lidar: np.ndarray = cast(np.ndarray, None)
+        self.optical_center: np.ndarray = cast(np.ndarray, None)
+        self.beams: np.ndarray = cast(np.ndarray, None)
+        self.azim_pm: float = cast(float, None)
+        self.elev_pm: float = cast(float, None)
+        self.height: int = cast(int, None)
+        self.width: int = cast(int, None)
+        self.pixel_shift_by_row: list = cast(list, None)
         self.obj_x_range = (0, 13)
         self.obj_y_range = (-5.625, 5.625)
         self.bg_x_range = (-1, 9)
         self.bg_y_range = (-9, 9)
 
         self.new_obj_xy = np.array([5.79, -1.00])
-        self.obj_xy = None
+        self.obj_xy: gui.TextEdit = cast(gui.TextEdit, None)
         self.hit_thresh = 0.025
         self.bg_min_dist = 0.1
         self.max_sector_angle = 2.25
         self.neighbors = 2
         self.use_colors = True
-        self.show_level_pcds = {"obj": True, "bg": True}
-        self.level_pcds = {}
+        self.show_level_pcds: dict[Which, bool] = {"obj": True, "bg": True}
+        self.level_pcds: dict[Which, o3d.geometry.PointCloud] = {}
         self.level_at_location = True
         self.use_ground_z = True
-        self.center_ground_ball = None
-        self.local_t = None
-        self.bg_t = None
-        self.bg_R = None
+        self.center_ground_ball: o3d.geometry.TriangleMesh = cast(
+            o3d.geometry.TriangleMesh, None
+        )
+        self.local_t: np.ndarray = cast(np.ndarray, None)
+        self.bg_t: np.ndarray = cast(np.ndarray, None)
+        self.bg_R: np.ndarray = cast(np.ndarray, None)
         self.occlude = True
         self.sim_lidar = True
+        self.placement_mode = False
+        self.placement_mode_check: gui.Checkbox = cast(gui.Checkbox, None)
         self.show_new_obj_loc = True
         self.show_lidar = False
         self.show_beams = False
@@ -308,26 +148,28 @@ class Paved2Paradise:
         self.end_beam_idx = 0
         self.point_size = 6.0
 
-        self.grid_pcds = {}
-        self.ground_planes = {}
-        self.ground_pcds = {}
-        self.level_ground_pcds = {}
+        self.grid_pcds: dict[Which, o3d.geometry.PointCloud] = {}
+        self.ground_planes: dict[Which, o3d.geometry.TriangleMesh] = {}
+        self.ground_pcds: dict[Which, o3d.geometry.PointCloud] = {}
+        self.level_ground_pcds: dict[Which, o3d.geometry.PointCloud] = {}
         self.grid_points = 100
-        self.grids_info = {
-            "obj": {"length": 7, "width": 6},
-            "bg": {"length": 7, "width": 6},
+        self.grids_info: dict[Which, dict[str, float]] = {
+            "obj": {"length": 7.0, "width": 6.0},
+            "bg": {"length": 7.0, "width": 6.0},
         }
-        self.show_grid_pcds = {"obj": False, "bg": False}
-        self.show_ground_planes = {"obj": False, "bg": False}
-        self.show_ground_pcds = {"obj": False, "bg": False}
+        self.show_grid_pcds: dict[Which, bool] = {"obj": False, "bg": False}
+        self.show_ground_planes: dict[Which, bool] = {"obj": False, "bg": False}
+        self.show_ground_pcds: dict[Which, bool] = {"obj": False, "bg": False}
 
         self.final_pcd = o3d.geometry.PointCloud()
-        self.simulated_object_points = None
-        self.close_img = None
-        self.og_bg_range_image = None
-        self.bg_range_image = None
+        self.simulated_object_points: np.ndarray = cast(np.ndarray, None)
+        self.close_img: Image.Image = cast(Image.Image, None)
+        self.og_bg_range_image: np.ndarray = cast(np.ndarray, None)
+        self.bg_range_image: np.ndarray = cast(np.ndarray, None)
 
-    def run(self):
+    def run(self) -> None:
+        """Build the GUI window and widgets, load the default scenes, and block
+        on Open3D's event loop until the window is closed."""
         app = gui.Application.instance
         app.initialize()
 
@@ -378,26 +220,38 @@ class Paved2Paradise:
         sensor_label = gui.Label("Sensor Selector")
         sensor_selector = gui.RadioButton(gui.RadioButton.Type.VERT)
         sensor_selector.set_items(SENSOR_IDX2SENSOR)
-        sensor_selector.set_on_selection_changed(self._on_sensor_changed)
+        # open3d's stub declares the callback parameter as the broader SupportsInt
+        # rather than int, which is actually passed at runtime.
+        sensor_selector.set_on_selection_changed(
+            self._on_sensor_changed  # pyright: ignore[reportArgumentType]
+        )
 
         obj_x_range_label = gui.Label("Object x Range (m)")
         obj_x_range = gui.TextEdit()
-        obj_x_range.set_on_value_changed(self._on_obj_x_range_changed)
+        obj_x_range.set_on_value_changed(
+            lambda v: self._on_range_changed("obj", "x", "Object x-range", v)
+        )
         obj_x_range.text_value = str(self.obj_x_range)
 
         obj_y_range_label = gui.Label("Object y Range (m)")
         obj_y_range = gui.TextEdit()
-        obj_y_range.set_on_value_changed(self._on_obj_y_range_changed)
+        obj_y_range.set_on_value_changed(
+            lambda v: self._on_range_changed("obj", "y", "Object y-range", v)
+        )
         obj_y_range.text_value = str(self.obj_y_range)
 
         bg_x_range_label = gui.Label("Background x Range (m)")
         bg_x_range = gui.TextEdit()
-        bg_x_range.set_on_value_changed(self._on_bg_x_range_changed)
+        bg_x_range.set_on_value_changed(
+            lambda v: self._on_range_changed("bg", "x", "Background x-range", v)
+        )
         bg_x_range.text_value = str(self.bg_x_range)
 
         bg_y_range_label = gui.Label("Background y Range (m)")
         bg_y_range = gui.TextEdit()
-        bg_y_range.set_on_value_changed(self._on_bg_y_range_changed)
+        bg_y_range.set_on_value_changed(
+            lambda v: self._on_range_changed("bg", "y", "Background y-range", v)
+        )
         bg_y_range.text_value = str(self.bg_y_range)
 
         v = gui.Vert(0.25 * em)
@@ -460,11 +314,11 @@ class Paved2Paradise:
         use_colors.checked = self.use_colors
 
         level_obj = gui.Checkbox("Level Object")
-        level_obj.set_on_checked(self._on_level_object)
+        level_obj.set_on_checked(lambda c: self._on_level_pcd("obj", c))
         level_obj.checked = self.show_level_pcds["obj"]
 
         level_bg = gui.Checkbox("Level Background")
-        level_bg.set_on_checked(self._on_level_background)
+        level_bg.set_on_checked(lambda c: self._on_level_pcd("bg", c))
         level_bg.checked = self.show_level_pcds["bg"]
 
         level_loc = gui.Checkbox("Level at Object Location")
@@ -482,6 +336,10 @@ class Paved2Paradise:
         sim_lidar = gui.Checkbox("Simulate LiDAR")
         sim_lidar.set_on_checked(self._on_sim_lidar)
         sim_lidar.checked = self.sim_lidar
+
+        self.placement_mode_check = gui.Checkbox("Placement Mode")
+        self.placement_mode_check.set_on_checked(self._on_placement_mode_changed)
+        self.placement_mode_check.checked = self.placement_mode
 
         show_new_obj_loc = gui.Checkbox("New Object Location")
         show_new_obj_loc.set_on_checked(self._on_show_new_obj_loc)
@@ -519,6 +377,7 @@ class Paved2Paradise:
         v.add_child(ground_z_check)
         v.add_child(occlude)
         v.add_child(sim_lidar)
+        v.add_child(self.placement_mode_check)
         v.add_child(show_new_obj_loc)
         v.add_child(show_lidar)
         v.add_child(show_beams)
@@ -536,41 +395,65 @@ class Paved2Paradise:
 
         obj_grid_length_label = gui.Label("Object Grid Length (m)")
         obj_grid_length = gui.TextEdit()
-        obj_grid_length.set_on_value_changed(self._on_obj_grid_length_changed)
+        obj_grid_length.set_on_value_changed(
+            lambda v: self._on_grid_dim_changed("obj", "length", "Object Grid Length", v)
+        )
         obj_grid_length.text_value = str(self.grids_info["obj"]["length"])
 
         obj_grid_width_label = gui.Label("Object Grid Width (m)")
         obj_grid_width = gui.TextEdit()
-        obj_grid_width.set_on_value_changed(self._on_obj_grid_width_changed)
+        obj_grid_width.set_on_value_changed(
+            lambda v: self._on_grid_dim_changed("obj", "width", "Object Grid Width", v)
+        )
         obj_grid_width.text_value = str(self.grids_info["obj"]["width"])
 
         bg_grid_length_label = gui.Label("Background Grid Length (m)")
         bg_grid_length = gui.TextEdit()
-        bg_grid_length.set_on_value_changed(self._on_bg_grid_length_changed)
+        bg_grid_length.set_on_value_changed(
+            lambda v: self._on_grid_dim_changed(
+                "bg", "length", "Background Grid Length", v
+            )
+        )
         bg_grid_length.text_value = str(self.grids_info["bg"]["length"])
 
         bg_grid_width_label = gui.Label("Background Grid Width (m)")
         bg_grid_width = gui.TextEdit()
-        bg_grid_width.set_on_value_changed(self._on_bg_grid_width_changed)
+        bg_grid_width.set_on_value_changed(
+            lambda v: self._on_grid_dim_changed(
+                "bg", "width", "Background Grid Width", v
+            )
+        )
         bg_grid_width.text_value = str(self.grids_info["bg"]["width"])
 
         obj_grid_points_check = gui.Checkbox("Object Grid")
-        obj_grid_points_check.set_on_checked(self._on_show_obj_grid_points)
+        obj_grid_points_check.set_on_checked(
+            lambda c: self._on_show_grid_points("obj", c)
+        )
 
         bg_grid_points_check = gui.Checkbox("Background Grid")
-        bg_grid_points_check.set_on_checked(self._on_show_bg_grid_points)
+        bg_grid_points_check.set_on_checked(
+            lambda c: self._on_show_grid_points("bg", c)
+        )
 
         obj_ground_plane_check = gui.Checkbox("Object Ground Plane")
-        obj_ground_plane_check.set_on_checked(self._on_show_obj_ground_plane)
+        obj_ground_plane_check.set_on_checked(
+            lambda c: self._on_show_ground_plane("obj", c)
+        )
 
         bg_ground_plane_check = gui.Checkbox("Background Ground Plane")
-        bg_ground_plane_check.set_on_checked(self._on_show_bg_ground_plane)
+        bg_ground_plane_check.set_on_checked(
+            lambda c: self._on_show_ground_plane("bg", c)
+        )
 
         obj_ground_points = gui.Checkbox("Object Ground Points")
-        obj_ground_points.set_on_checked(self._on_show_obj_ground_points)
+        obj_ground_points.set_on_checked(
+            lambda c: self._on_show_ground_points("obj", c)
+        )
 
         bg_ground_points = gui.Checkbox("Background Ground Points")
-        bg_ground_points.set_on_checked(self._on_show_bg_ground_points)
+        bg_ground_points.set_on_checked(
+            lambda c: self._on_show_ground_points("bg", c)
+        )
 
         v = gui.Vert(0.25 * em)
         v.add_child(grid_points_label)
@@ -599,17 +482,22 @@ class Paved2Paradise:
         self._on_load_background_dialog_done(DEFAULT_BG_F)
 
         self.comb_window.set_on_mouse(self._on_mouse_widget3d)
+        self.w.set_on_key(self._on_key)
 
         app.run()
 
-    def _on_mouse_widget3d(self, event):
+    def _on_mouse_widget3d(
+        self, event: gui.MouseEvent
+    ) -> gui.Widget.EventCallbackResult:
+        """Right-click in the combined scene to print the clicked (x, y, z) world
+        coordinates, and -- while placement mode (toggled by pressing "P") is
+        active -- also move the object there."""
         # See: https://github.com/isl-org/Open3D/blob/main/examples/python/visualization/mouse_and_point_coord.py.
         if (event.type == gui.MouseEvent.Type.BUTTON_DOWN) and (
-            event.is_modifier_down(gui.KeyModifier.ALT)
-            or (event.buttons == int(gui.MouseButton.RIGHT))
+            event.buttons == int(gui.MouseButton.RIGHT)
         ):
 
-            def depth_callback(depth_image):
+            def depth_callback(depth_image) -> None:
                 # Coordinates are expressed in absolute coordinates of the window, but
                 # to dereference the image correctly we need them relative to the origin
                 # of the widget. Note that even if the scene widget is the only thing in
@@ -631,9 +519,8 @@ class Paved2Paradise:
                         self.comb_window.frame.width,
                         self.comb_window.frame.height,
                     )
-                    if event.buttons == int(gui.MouseButton.RIGHT):
-                        print(world)
-                    else:
+                    print(world)
+                    if self.placement_mode:
                         obj_xy_text = f"({world[0]:.2f}, {world[1]:.2f})"
                         self.obj_xy.text_value = obj_xy_text
                         self._on_obj_xy_changed(self.obj_xy.text_value)
@@ -643,7 +530,24 @@ class Paved2Paradise:
             return gui.Widget.EventCallbackResult.HANDLED
         return gui.Widget.EventCallbackResult.IGNORED
 
-    def _on_layout(self, layout_context):
+    def _on_key(self, event: gui.KeyEvent) -> bool:
+        """Pressing "P" toggles placement mode (see _on_mouse_widget3d)."""
+        if (
+            (event.type == gui.KeyEvent.Type.DOWN)
+            and (event.key == gui.KeyName.P)
+            and not event.is_repeat
+        ):
+            self.placement_mode = not self.placement_mode
+            self.placement_mode_check.checked = self.placement_mode
+
+        return False
+
+    def _on_placement_mode_changed(self, checked: bool) -> None:
+        self.placement_mode = checked
+
+    def _on_layout(self, layout_context: gui.LayoutContext) -> None:
+        """Lay the three scene views out side by side, with the settings panel
+        docked to the right."""
         r = self.w.content_rect
         settings_width = 17 * layout_context.theme.font_size
         display_width = r.width - settings_width
@@ -664,13 +568,15 @@ class Paved2Paradise:
             r.get_right() - settings_width, r.y, settings_width, height
         )
 
-    def _on_open_object_scene(self):
+    def _on_open_object_scene(self) -> None:
+        """Open a file dialog to choose a new object scene point cloud."""
         dlg = gui.FileDialog(gui.FileDialog.OPEN, "Choose object scene.", self.theme)
         dlg.set_on_cancel(self._on_file_dialog_cancel)
         dlg.set_on_done(self._on_load_object_dialog_done)
         self.w.show_dialog(dlg)
 
-    def _on_open_background_scene(self):
+    def _on_open_background_scene(self) -> None:
+        """Open a file dialog to choose a new background scene point cloud."""
         dlg = gui.FileDialog(
             gui.FileDialog.OPEN, "Choose background scene.", self.theme
         )
@@ -678,39 +584,56 @@ class Paved2Paradise:
         dlg.set_on_done(self._on_load_background_dialog_done)
         self.w.show_dialog(dlg)
 
-    def _on_file_dialog_cancel(self):
+    def _on_file_dialog_cancel(self) -> None:
         self.w.close_dialog()
 
-    def render_obj_scene(self):
-        self.obj_window.scene.clear_geometry()
-        if self.show_ground_pcds["obj"]:
-            if self.show_level_pcds["obj"]:
-                pcd = self.level_ground_pcds["obj"]
-            else:
-                pcd = self.ground_pcds["obj"]
+    def render_scene(self, which: Which) -> None:
+        """Redraw the object or background scene view from current toggle state
+        (leveled/raw, grid points, ground plane, ground points)."""
+        window = self.obj_window if which == "obj" else self.bg_window
+        window.scene.clear_geometry()
+
+        if self.show_ground_pcds[which]:
+            pcd = (
+                self.level_ground_pcds[which]
+                if self.show_level_pcds[which]
+                else self.ground_pcds[which]
+            )
         else:
-            if self.show_level_pcds["obj"]:
-                pcd = self.level_pcds["obj"]
-                bbox = self.level_obj_bbox
-            else:
-                pcd = self.pcds["obj"]
-                bbox = self.obj_bbox
+            pcd = (
+                self.level_pcds[which]
+                if self.show_level_pcds[which]
+                else self.pcds[which]
+            )
+            if which == "obj":
+                bbox = (
+                    self.level_obj_bbox
+                    if self.show_level_pcds[which]
+                    else self.obj_bbox
+                )
+                window.scene.add_geometry("Bounding Box", bbox, self.bbox_mat)
 
-            self.obj_window.scene.add_geometry("Bounding Box", bbox, self.bbox_mat)
+        window.scene.add_geometry("Points", pcd, self.mat)
 
-        self.obj_window.scene.add_geometry("Points", pcd, self.mat)
+        if self.show_grid_pcds[which]:
+            window.scene.add_geometry("Grid Points", self.grid_pcds[which], self.mat)
 
-        if self.show_grid_pcds["obj"]:
-            self.obj_window.scene.add_geometry(
-                "Grid Points", self.grid_pcds["obj"], self.mat
+        if self.show_ground_planes[which]:
+            window.scene.add_geometry(
+                "Ground Plane", self.ground_planes[which], self.mat
             )
 
-        if self.show_ground_planes["obj"]:
-            self.obj_window.scene.add_geometry(
-                "Ground Plane", self.ground_planes["obj"], self.mat
-            )
+        if (which == "bg") and self.show_new_obj_loc:
+            cyl = o3d.geometry.TriangleMesh.create_cylinder(CYL_RADIUS)
+            z_bbox = self.level_obj_bbox if self.show_level_pcds["bg"] else self.obj_bbox
+            center = np.array([self.new_obj_xy[0], self.new_obj_xy[1], z_bbox.center[2]])
+            cyl.translate(center, relative=False)
+            cyl.paint_uniform_color(BBOX_COLOR)
+            window.scene.add_geometry("New Object Location", cyl, self.mat)
 
-    def _on_load_object_dialog_done(self, pcd_f):
+    def _on_load_object_dialog_done(self, pcd_f: str) -> None:
+        """Load a new object scene point cloud and its bounding box annotation
+        (a sibling .json from Segments.ai, or a sibling .npy), then refresh."""
         self.w.close_dialog()
         suffix = pcd_f.split(".")[-1]
         if suffix not in PCD_SUFFIXES:
@@ -743,48 +666,17 @@ class Paved2Paradise:
         self.obj_bbox = o3d.geometry.OrientedBoundingBox(center, bbox_R, extent)
         self.obj_bbox.color = BBOX_COLOR
 
-        self.obj_pcd = o3d.io.read_point_cloud(pcd_f)
+        # open3d's stub omits plain str from the accepted path types, though it
+        # works fine at runtime.
+        self.obj_pcd = o3d.io.read_point_cloud(
+            pcd_f  # pyright: ignore[reportArgumentType]
+        )
         self._on_obj_xy_range_changed()
         self.simulate_scene()
 
-    def render_bg_scene(self):
-        self.bg_window.scene.clear_geometry()
-        if self.show_level_pcds["bg"]:
-            if self.show_ground_pcds["bg"]:
-                pcd = self.level_ground_pcds["bg"]
-            else:
-                pcd = self.level_pcds["bg"]
-        else:
-            if self.show_ground_pcds["bg"]:
-                pcd = self.ground_pcds["bg"]
-            else:
-                pcd = self.pcds["bg"]
-
-        self.bg_window.scene.add_geometry("Points", pcd, self.mat)
-
-        if self.show_grid_pcds["bg"]:
-            self.bg_window.scene.add_geometry(
-                "Grid Points", self.grid_pcds["bg"], self.mat
-            )
-
-        if self.show_ground_planes["bg"]:
-            self.bg_window.scene.add_geometry(
-                "Ground Plane", self.ground_planes["bg"], self.mat
-            )
-
-        if self.show_new_obj_loc:
-            cyl = o3d.geometry.TriangleMesh.create_cylinder(CYL_RADIUS)
-            if self.show_level_pcds["bg"]:
-                z = self.level_obj_bbox.center[2]
-            else:
-                z = self.obj_bbox.center[2]
-
-            center = np.array([self.new_obj_xy[0], self.new_obj_xy[1], z])
-            cyl.translate(center, relative=False)
-            cyl.paint_uniform_color(BBOX_COLOR)
-            self.bg_window.scene.add_geometry("New Object Location", cyl, self.mat)
-
-    def _on_load_background_dialog_done(self, pcd_f):
+    def _on_load_background_dialog_done(self, pcd_f: str) -> None:
+        """Load a new background scene point cloud, destagger it into a range
+        image (undoing the sensor's per-row pixel shift), and refresh."""
         self.w.close_dialog()
         suffix = pcd_f.split(".")[-1]
         if suffix not in PCD_SUFFIXES:
@@ -792,7 +684,11 @@ class Paved2Paradise:
             return
 
         if suffix == "pcd":
-            self.bg_pcd = o3d.io.read_point_cloud(pcd_f)
+            # open3d's stub omits plain str from the accepted path types, though it
+            # works fine at runtime.
+            self.bg_pcd = o3d.io.read_point_cloud(
+                pcd_f  # pyright: ignore[reportArgumentType]
+            )
         else:
             self.bg_pcd = o3d.geometry.PointCloud()
             self.bg_pcd.points = o3d.utility.Vector3dVector(np.load(pcd_f))
@@ -837,10 +733,11 @@ class Paved2Paradise:
         self._on_bg_xy_range_changed()
         self.simulate_scene()
 
-    def _on_dialog_ok(self):
+    def _on_dialog_ok(self) -> None:
         self.w.close_dialog()
 
-    def _create_dialog(self, title, message):
+    def _create_dialog(self, title: str, message: str) -> None:
+        """Show a modal dialog with a single OK button."""
         dlg = gui.Dialog(title)
 
         em = self.theme.font_size
@@ -854,7 +751,12 @@ class Paved2Paradise:
         dlg.add_child(dlg_layout)
         self.w.show_dialog(dlg)
 
-    def get_Ds(self):
+    def get_Ds(self) -> None:
+        """Compute each LiDAR beam's unit ray direction (self.Ds), plus its
+        azimuth/elevation (self.D_azims/self.D_elevs) and per-pixel angular size
+        (self.azim_pm/self.elev_pm), from the current sensor's beam altitude angles
+        and orientation. Used by unocclude()/render_beams() to test which beams
+        pass near the object."""
         azims = np.linspace(-np.pi, np.pi, self.width, False)
         (min_elev, max_elev) = (self.beams.min(), self.beams.max())
         elev_azims = np.stack(np.meshgrid(-self.beams, azims))
@@ -866,7 +768,9 @@ class Paved2Paradise:
         self.D_elevs = np.arcsin(self.Ds[:, 2] / np.linalg.norm(self.Ds, axis=1))
         self.elev_pm = (max_elev - min_elev) / self.height
 
-    def update_sensor_params(self, sensor):
+    def update_sensor_params(self, sensor: str) -> None:
+        """Load the named sensor's intrinsics (from lidar2intrinsics) and recompute
+        its beam ray directions."""
         intrinsics = lidar2intrinsics[sensor]
         quat = intrinsics["sensor_model_rotation"]
         quat = np.array([quat["x"], quat["y"], quat["z"], quat["w"]])
@@ -880,14 +784,16 @@ class Paved2Paradise:
         self.pixel_shift_by_row = intrinsics["pixel_shift_by_row"]
         self.get_Ds()
 
-    def _on_sensor_changed(self, sensor_idx):
+    def _on_sensor_changed(self, sensor_idx: int) -> None:
         self.update_sensor_params(SENSOR_IDX2SENSOR[sensor_idx])
         self.simulate_scene()
 
-    def _on_show_range_image(self):
+    def _on_show_range_image(self) -> None:
         self.create_range_images()
 
-    def _on_obj_xy_range_changed(self):
+    def _on_obj_xy_range_changed(self) -> None:
+        """Re-crop the object scene to self.obj_x_range/self.obj_y_range and
+        refresh everything derived from it (grid, ground plane, leveling, view)."""
         points = np.array(self.obj_pcd.points)
         in_x = (self.obj_x_range[0] < points[:, 0]) & (
             points[:, 0] < self.obj_x_range[1]
@@ -895,7 +801,7 @@ class Paved2Paradise:
         in_y = (self.obj_y_range[0] < points[:, 1]) & (
             points[:, 1] < self.obj_y_range[1]
         )
-        obj_pcd = self.obj_pcd.select_by_index(np.where(in_x & in_y)[0])
+        obj_pcd = self.obj_pcd.select_by_index(np.where(in_x & in_y)[0].tolist())
         self.pcds["obj"] = obj_pcd
         if not obj_pcd.has_colors():
             color_by_dist(obj_pcd)
@@ -909,34 +815,32 @@ class Paved2Paradise:
         self.create_grid_points("obj")
         self.create_ground_plane("obj")
         self.level_scene("obj")
-        self.render_obj_scene()
+        self.render_scene("obj")
         self.simulate_scene()
 
-    def _on_obj_x_range_changed(self, obj_x_range):
+    def _on_range_changed(
+        self, which: Which, axis: Literal["x", "y"], label: str, value_str: str
+    ) -> None:
+        """Parse a "(min, max)" range text field into self.<which>_<axis>_range and
+        refresh the matching scene's point selection."""
         try:
-            self.obj_x_range = eval(obj_x_range)
-            self._on_obj_xy_range_changed()
-        except:
-            self._create_dialog(
-                "Input Error", "Object x-range must be a tuple of floats."
-            )
+            setattr(self, f"{which}_{axis}_range", ast.literal_eval(value_str))
+        except (ValueError, SyntaxError, TypeError):
+            self._create_dialog("Input Error", f"{label} must be a tuple of floats.")
             return
 
-    def _on_obj_y_range_changed(self, obj_y_range):
-        try:
-            self.obj_y_range = eval(obj_y_range)
+        if which == "obj":
             self._on_obj_xy_range_changed()
-        except:
-            self._create_dialog(
-                "Input Error", "Object y-range must be a tuple of floats."
-            )
-            return
+        else:
+            self._on_bg_xy_range_changed()
 
-    def _on_bg_xy_range_changed(self):
+    def _on_bg_xy_range_changed(self) -> None:
+        """Re-crop the background scene to self.bg_x_range/self.bg_y_range, rebuild
+        its range image, and refresh everything derived from it."""
         points = np.array(self.bg_pcd.points)
         in_x = (self.bg_x_range[0] < points[:, 0]) & (points[:, 0] < self.bg_x_range[1])
         in_y = (self.bg_y_range[0] < points[:, 1]) & (points[:, 1] < self.bg_y_range[1])
-        bg_pcd = self.bg_pcd.select_by_index(np.where(in_x & in_y)[0])
+        bg_pcd = self.bg_pcd.select_by_index(np.where(in_x & in_y)[0].tolist())
         self.pcds["bg"] = bg_pcd
         if not bg_pcd.has_colors():
             color_by_dist(bg_pcd)
@@ -966,45 +870,39 @@ class Paved2Paradise:
         self.create_grid_points("bg")
         self.create_ground_plane("bg")
         self.level_scene("bg")
-        self.render_bg_scene()
+        self.render_scene("bg")
         self.simulate_scene()
 
-    def _on_bg_x_range_changed(self, bg_x_range):
+    def _on_obj_xy_changed(self, obj_xy: str) -> None:
+        """Parse the "(x, y)" new-object-location text field and refresh the
+        background scene's placement marker."""
         try:
-            self.bg_x_range = eval(bg_x_range)
-            self._on_bg_xy_range_changed()
-        except:
-            self._create_dialog(
-                "Input Error", "Background x-range must be a tuple of floats."
-            )
-            return
-
-    def _on_bg_y_range_changed(self, bg_y_range):
-        try:
-            self.bg_y_range = eval(bg_y_range)
-            self._on_bg_xy_range_changed()
-        except:
-            self._create_dialog(
-                "Input Error", "Background y-range must be a tuple of floats."
-            )
-            return
-
-    def _on_obj_xy_changed(self, obj_xy):
-        try:
-            self.new_obj_xy = np.array(eval(obj_xy))
-        except:
+            new_obj_xy = np.array(ast.literal_eval(obj_xy))
+        except (ValueError, SyntaxError, TypeError):
             self._create_dialog(
                 "Input Error", "Object (x, y)-coordinates must be a tuple of floats."
+            )
+            return
+
+        previous_obj_xy = self.new_obj_xy
+        self.new_obj_xy = new_obj_xy
+        if not self._has_bg_points_near_grid():
+            self.new_obj_xy = previous_obj_xy
+            self.obj_xy.text_value = str(tuple(previous_obj_xy))
+            self._create_dialog(
+                "Input Error",
+                "That location has no nearby background points to level against. "
+                "Try a location within the background scene.",
             )
             return
 
         self.create_ground_plane("bg")
         self.create_grid_points("bg")
         self.level_scene("bg")
-        self.render_bg_scene()
+        self.render_scene("bg")
         self.simulate_scene()
 
-    def _on_hit_thresh_changed(self, hit_thresh):
+    def _on_hit_thresh_changed(self, hit_thresh: str) -> None:
         try:
             self.hit_thresh = float(hit_thresh)
         except ValueError:
@@ -1013,17 +911,18 @@ class Paved2Paradise:
 
         self.simulate_scene()
 
-    def _on_bg_min_dist_changed(self, bg_min_dist):
+    def _on_bg_min_dist_changed(self, bg_min_dist: str) -> None:
         try:
             self.bg_min_dist = float(bg_min_dist)
-            self._on_bg_xy_range_changed()
-        except:
+        except ValueError:
             self._create_dialog(
                 "Input Error", "Background min. distance must be a float."
             )
             return
 
-    def _on_max_sector_changed(self, max_sector_angle):
+        self._on_bg_xy_range_changed()
+
+    def _on_max_sector_changed(self, max_sector_angle: str) -> None:
         try:
             self.max_sector_angle = float(max_sector_angle)
         except ValueError:
@@ -1032,7 +931,7 @@ class Paved2Paradise:
 
         self.simulate_scene()
 
-    def _on_neighbors_changed(self, neighbors):
+    def _on_neighbors_changed(self, neighbors: str) -> None:
         try:
             self.neighbors = int(neighbors)
         except ValueError:
@@ -1041,7 +940,7 @@ class Paved2Paradise:
 
         self.simulate_scene()
 
-    def _on_point_size_changed(self, point_size):
+    def _on_point_size_changed(self, point_size: str) -> None:
         try:
             self.point_size = float(point_size)
         except ValueError:
@@ -1050,11 +949,21 @@ class Paved2Paradise:
 
         self.mat.point_size = self.point_size
         self.comb_mat.point_size = self.point_size
-        self.render_obj_scene()
-        self.render_bg_scene()
+        self.render_scene("obj")
+        self.render_scene("bg")
         self.simulate_scene()
 
-    def level_scene(self, which):
+    def level_scene(self, which: Which) -> None:
+        """Estimate the ground plane under the object or background scene's
+        leveling grid, and store the rotation/translation that levels it (i.e.,
+        makes the ground plane horizontal at z=0).
+
+        For "obj", also levels self.obj_bbox into self.level_obj_bbox. For "bg",
+        instead stores the leveling transform itself (self.bg_t/self.bg_R, used by
+        unlevel() to place an object into this background) and, if
+        self.use_ground_z, the local ground height under the placement location
+        (self.local_t).
+        """
         which_pcd = self.pcds[which]
         points = np.array(which_pcd.points)
 
@@ -1065,7 +974,7 @@ class Paved2Paradise:
         y_end = y_start + self.grids_info[which]["width"]
         in_x = (x_start < points[:, 0]) & (points[:, 0] < x_end)
         in_y = (y_start < points[:, 1]) & (points[:, 1] < y_end)
-        region_pcd = which_pcd.select_by_index(np.where(in_x & in_y)[0])
+        region_pcd = which_pcd.select_by_index(np.where(in_x & in_y)[0].tolist())
 
         # For each grid point, find nearest neighbor in scene point cloud. These are our
         # "ground" points.
@@ -1073,7 +982,7 @@ class Paved2Paradise:
         grid_points = np.array(self.grid_pcds[which].points)
         (_, pcd_idxs) = nbrs.kneighbors(grid_points)
         pcd_idxs = np.unique(pcd_idxs)
-        ground_pcd = region_pcd.select_by_index(pcd_idxs)
+        ground_pcd = region_pcd.select_by_index(pcd_idxs.tolist())
         self.ground_pcds[which] = ground_pcd
         if not ground_pcd.has_colors():
             color_by_dist(ground_pcd)
@@ -1135,51 +1044,48 @@ class Paved2Paradise:
             self.bg_t = -t
             self.bg_R = R
 
-    def _on_use_colors(self, use_colors):
+    def _on_use_colors(self, use_colors: bool) -> None:
         self.use_colors = use_colors
         self.simulate_scene()
 
-    def _on_level_object(self, level_obj):
-        self.show_level_pcds["obj"] = level_obj
-        self.render_obj_scene()
+    def _on_level_pcd(self, which: Which, checked: bool) -> None:
+        """Toggle whether the object or background scene is shown in its leveled
+        frame."""
+        self.show_level_pcds[which] = checked
+        self.render_scene(which)
         self.simulate_scene()
 
-    def _on_level_background(self, level_bg):
-        self.show_level_pcds["bg"] = level_bg
-        self.render_bg_scene()
-        self.simulate_scene()
-
-    def _on_level_location(self, level_loc):
+    def _on_level_location(self, level_loc: bool) -> None:
         self.level_at_location = level_loc
         self.create_ground_plane("bg")
         self.create_grid_points("bg")
         self.level_scene("bg")
-        self.render_bg_scene()
+        self.render_scene("bg")
         self.simulate_scene()
 
-    def _on_use_ground_z(self, use_ground_z):
+    def _on_use_ground_z(self, use_ground_z: bool) -> None:
         self.use_ground_z = use_ground_z
         if not use_ground_z:
             self.comb_window.scene.remove_geometry("Center Ground Point")
 
         self.level_scene("bg")
-        self.render_bg_scene()
+        self.render_scene("bg")
         self.simulate_scene()
 
-    def _on_occlude(self, occlude):
+    def _on_occlude(self, occlude: bool) -> None:
         self.occlude = occlude
         self.simulate_scene()
 
-    def _on_sim_lidar(self, sim_lidar):
+    def _on_sim_lidar(self, sim_lidar: bool) -> None:
         self.sim_lidar = sim_lidar
         self.simulate_scene()
 
-    def _on_show_new_obj_loc(self, show_new_obj_loc):
+    def _on_show_new_obj_loc(self, show_new_obj_loc: bool) -> None:
         self.show_new_obj_loc = show_new_obj_loc
-        self.render_bg_scene()
+        self.render_scene("bg")
         self.simulate_scene()
 
-    def _on_show_lidar(self, show_lidar):
+    def _on_show_lidar(self, show_lidar: bool) -> None:
         self.show_lidar = show_lidar
         if not show_lidar:
             self.comb_window.scene.remove_geometry("Top LiDAR Cone")
@@ -1187,7 +1093,7 @@ class Paved2Paradise:
 
         self.simulate_scene()
 
-    def _on_show_beams(self, show_beams):
+    def _on_show_beams(self, show_beams: bool) -> None:
         self.show_beams = show_beams
         if not show_beams:
             self.comb_window.scene.remove_geometry("Unoccluded Point Cloud")
@@ -1196,9 +1102,11 @@ class Paved2Paradise:
 
         self.simulate_scene()
 
-    def _on_beam_range_changed(self, beam_range):
+    def _on_beam_range_changed(self, beam_range: str) -> None:
+        """Parse the "(start, end)" beam index range text field; (0, 0) means
+        auto-detect the beams near the object instead of a fixed range."""
         try:
-            self.start_beam_idx, self.end_beam_idx = eval(beam_range)
+            self.start_beam_idx, self.end_beam_idx = ast.literal_eval(beam_range)
             if (self.start_beam_idx < 0) or (self.end_beam_idx > len(self.Rs)):
                 raise ValueError
 
@@ -1209,7 +1117,7 @@ class Paved2Paradise:
             if (self.start_beam_idx == self.end_beam_idx) and is_zero:
                 raise ValueError
 
-        except ValueError:
+        except (ValueError, SyntaxError, TypeError):
             self._create_dialog(
                 "Input Error", "Beam Range must be a tuple of integers."
             )
@@ -1217,7 +1125,11 @@ class Paved2Paradise:
 
         self.simulate_scene()
 
-    def get_grid_xy(self, which):
+    def get_grid_xy(self, which: Which) -> tuple[float, float]:
+        """Get the (x, y) center of the object or background scene's leveling
+        grid: the object's bounding box center for "obj", or either the new
+        object location or the grid's default position for "bg", depending on
+        self.level_at_location."""
         if which == "obj":
             grid_x = self.obj_bbox.center[0]
             grid_y = self.obj_bbox.center[1]
@@ -1231,7 +1143,26 @@ class Paved2Paradise:
 
         return (grid_x, grid_y)
 
-    def create_grid_points(self, which):
+    def _has_bg_points_near_grid(self) -> bool:
+        """Whether the background scene has any points inside the leveling grid
+        centered at its current grid location (see get_grid_xy). Used to reject
+        a new object location before create_grid_points()/level_scene() -- which
+        assume there's at least one point to find a ground plane from -- run
+        against it."""
+        (grid_x, grid_y) = self.get_grid_xy("bg")
+        x_start = grid_x - self.grids_info["bg"]["length"] / 2
+        x_end = x_start + self.grids_info["bg"]["length"]
+        y_start = grid_y - self.grids_info["bg"]["width"] / 2
+        y_end = y_start + self.grids_info["bg"]["width"]
+        points = np.array(self.pcds["bg"].points)
+        in_x = (x_start < points[:, 0]) & (points[:, 0] < x_end)
+        in_y = (y_start < points[:, 1]) & (points[:, 1] < y_end)
+        return bool(np.any(in_x & in_y))
+
+    def create_grid_points(self, which: Which) -> None:
+        """Build a flat grid of points, at the lowest z in the region, used by
+        level_scene() to sample the ground surface under the object or
+        background scene."""
         points = np.array(self.pcds[which].points)
 
         (grid_x, grid_y) = self.get_grid_xy(which)
@@ -1255,7 +1186,9 @@ class Paved2Paradise:
 
         self.grid_pcds[which] = grid_pcd
 
-    def create_ground_plane(self, which):
+    def create_ground_plane(self, which: Which) -> None:
+        """Build a flat box mesh spanning the object or background scene's
+        leveling grid, for visualizing where level_scene() samples the ground."""
         grid_width = self.grids_info[which]["width"]
         grid_length = self.grids_info[which]["length"]
         ground_plane = o3d.geometry.TriangleMesh.create_box(
@@ -1267,100 +1200,64 @@ class Paved2Paradise:
 
         self.ground_planes[which] = ground_plane
 
-    def _on_grid_points_changed(self, grid_points):
+    def _on_grid_points_changed(self, grid_points: str) -> None:
         try:
             self.grid_points = int(grid_points)
         except ValueError:
             self._create_dialog("Input Error", "Grid Points must be an integer.")
             return
 
-        for which in ["obj", "bg"]:
+        for which in ("obj", "bg"):
             self.create_grid_points(which)
             self.level_scene(which)
 
-        self.render_obj_scene()
-        self.render_bg_scene()
+        self.render_scene("obj")
+        self.render_scene("bg")
         self.simulate_scene()
 
-    def _on_obj_grid_length_changed(self, grid_length):
+    def _on_grid_dim_changed(
+        self, which: Which, dim: Literal["length", "width"], label: str, value_str: str
+    ) -> None:
+        """Parse a grid length/width text field into self.grids_info[which][dim]
+        and rebuild everything derived from the leveling grid."""
         try:
-            self.grids_info["obj"]["length"] = float(grid_length)
+            self.grids_info[which][dim] = float(value_str)
         except ValueError:
-            self._create_dialog("Input Error", "Object Grid Length must be a float.")
+            self._create_dialog("Input Error", f"{label} must be a float.")
             return
 
-        self.create_grid_points("obj")
-        self.create_ground_plane("obj")
-        self.level_scene("obj")
-        self.render_obj_scene()
+        self.create_grid_points(which)
+        self.create_ground_plane(which)
+        self.level_scene(which)
+        self.render_scene(which)
         self.simulate_scene()
 
-    def _on_obj_grid_width_changed(self, grid_width):
-        try:
-            self.grids_info["obj"]["width"] = float(grid_width)
-        except ValueError:
-            self._create_dialog("Input Error", "Object Grid Width must be a float.")
-            return
+    def _on_show_grid_points(self, which: Which, checked: bool) -> None:
+        """Toggle the leveling grid point overlay for the object or background
+        scene."""
+        self.show_grid_pcds[which] = checked
+        self.render_scene(which)
 
-        self.create_grid_points("obj")
-        self.create_ground_plane("obj")
-        self.level_scene("obj")
-        self.render_obj_scene()
-        self.simulate_scene()
+    def _on_show_ground_plane(self, which: Which, checked: bool) -> None:
+        """Toggle the leveling grid's ground-plane overlay for the object or
+        background scene."""
+        self.show_ground_planes[which] = checked
+        self.render_scene(which)
 
-    def _on_bg_grid_length_changed(self, grid_length):
-        try:
-            self.grids_info["bg"]["length"] = float(grid_length)
-        except ValueError:
-            self._create_dialog(
-                "Input Error", "Background Grid Length must be a float."
-            )
-            return
+    def _on_show_ground_points(self, which: Which, checked: bool) -> None:
+        """Toggle the detected ground point overlay for the object or background
+        scene."""
+        self.show_ground_pcds[which] = checked
+        self.render_scene(which)
 
-        self.create_grid_points("bg")
-        self.create_ground_plane("bg")
-        self.level_scene("bg")
-        self.render_bg_scene()
-        self.simulate_scene()
-
-    def _on_bg_grid_width_changed(self, grid_length):
-        try:
-            self.grids_info["bg"]["width"] = float(grid_length)
-        except ValueError:
-            self._create_dialog("Input Error", "Background Grid Width must be a float.")
-            return
-
-        self.create_grid_points("bg")
-        self.create_ground_plane("bg")
-        self.level_scene("bg")
-        self.render_bg_scene()
-        self.simulate_scene()
-
-    def _on_show_obj_grid_points(self, show_obj_ground_points):
-        self.show_grid_pcds["obj"] = show_obj_ground_points
-        self.render_obj_scene()
-
-    def _on_show_obj_ground_plane(self, show_obj_ground_plane):
-        self.show_ground_planes["obj"] = show_obj_ground_plane
-        self.render_obj_scene()
-
-    def _on_show_obj_ground_points(self, show_obj_ground_points):
-        self.show_ground_pcds["obj"] = show_obj_ground_points
-        self.render_obj_scene()
-
-    def _on_show_bg_grid_points(self, show_bg_ground_points):
-        self.show_grid_pcds["bg"] = show_bg_ground_points
-        self.render_bg_scene()
-
-    def _on_show_bg_ground_plane(self, show_bg_ground_plane):
-        self.show_ground_planes["bg"] = show_bg_ground_plane
-        self.render_bg_scene()
-
-    def _on_show_bg_ground_points(self, show_bg_ground_points):
-        self.show_ground_pcds["bg"] = show_bg_ground_points
-        self.render_bg_scene()
-
-    def render_beams(self, simulated_object_points, moved_object_points):
+    def render_beams(
+        self, simulated_object_points: np.ndarray, moved_object_points: np.ndarray
+    ) -> None:
+        """Visualize the LiDAR beams used to determine which points on the object
+        a beam would actually hit: draws the pre-unocclude ("Unoccluded") object
+        point cloud, shows the range image it would project to, and draws an
+        arrow for each beam that's either in self.start_beam_idx/self.end_beam_idx
+        or (if that range is (0, 0)) auto-detected as passing near the object."""
         self.comb_window.scene.remove_geometry("Unoccluded Point Cloud")
         unfiltered_pcd = o3d.geometry.PointCloud(
             o3d.utility.Vector3dVector(simulated_object_points[:, :3])
@@ -1406,15 +1303,17 @@ class Paved2Paradise:
         pitch_R = Rotation.from_euler("Y", np.pi / 2).as_matrix()
         arrow.rotate(pitch_R, center=(0, 0, 0))
         if self.start_beam_idx == self.end_beam_idx == 0:
-            point_azims = np.arctan2(
-                moved_object_points[:, 1], moved_object_points[:, 0]
-            )
+            # D_azims/D_elevs are beam directions relative to the optical center (see
+            # get_Ds() and the matching shift in unocclude()), so the points need the
+            # same shift before their angles are comparable.
+            centered_points = moved_object_points[:, :3] - self.optical_center
+            point_azims = np.arctan2(centered_points[:, 1], centered_points[:, 0])
             min_azim = point_azims.min() - self.azim_pm
             max_azim = point_azims.max() + self.azim_pm
             azim_mask = (min_azim < self.D_azims) & (self.D_azims < max_azim)
 
-            point_norms = np.linalg.norm(moved_object_points[:, :3], axis=1)
-            point_elevs = np.arcsin(moved_object_points[:, 2] / point_norms)
+            point_norms = np.linalg.norm(centered_points, axis=1)
+            point_elevs = np.arcsin(centered_points[:, 2] / point_norms)
             min_elev = point_elevs.min() - self.elev_pm
             max_elev = point_elevs.max() + self.elev_pm
             elev_mask = (min_elev < self.D_elevs) & (self.D_elevs < max_elev)
@@ -1433,7 +1332,12 @@ class Paved2Paradise:
                 f"Arrow {idx}", arrow_copy, self.comb_mat
             )
 
-    def simulate_scene(self):
+    def simulate_scene(self) -> None:
+        """Run the full augmentation pipeline and render the result in the
+        combined scene view: place the object at self.new_obj_xy in the
+        background's frame, keep only the object points a LiDAR beam would
+        actually hit (unocclude()) if self.sim_lidar, then simulate
+        occlusion by the background (project_points()) if self.occlude."""
         if not (("obj" in self.pcds) and ("bg" in self.pcds)):
             return
 
@@ -1448,7 +1352,7 @@ class Paved2Paradise:
             bg_t = np.copy(self.bg_t)
             bg_R = self.bg_R
         else:
-            bg_t = 0
+            bg_t = np.zeros(3)
             bg_R = np.eye(3)
 
         if self.use_ground_z:
@@ -1458,7 +1362,7 @@ class Paved2Paradise:
         if self.show_level_pcds["obj"]:
             # Only keep points above the ground.
             object_pcd = object_pcd.select_by_index(
-                np.where(np.array(object_pcd.points)[:, 2] > 0)[0]
+                np.where(np.array(object_pcd.points)[:, 2] > 0)[0].tolist()
             )
 
         if self.show_new_obj_loc:
@@ -1590,7 +1494,10 @@ class Paved2Paradise:
             bbox = self.comb_window.scene.bounding_box
             self.comb_window.setup_camera(60.0, bbox, bbox.get_center())
 
-    def create_range_images(self):
+    def create_range_images(self) -> None:
+        """Show the simulated scene's range image, and a second image isolating
+        just the pixels that came from the placed object (its "difference" from
+        the background), alongside the background's own range image."""
         range_image = project_points(
             self.bg_range_image.copy(),
             self.simulated_object_points,
@@ -1611,7 +1518,7 @@ class Paved2Paradise:
         self.close_img.show()
 
 
-def main():
+def main() -> None:
     Paved2Paradise().run()
 
 
